@@ -1,0 +1,30 @@
+{
+  "name": "panda-api",
+  "private": true,
+  "type": "module",
+  "version": "1.1.0",
+  "scripts": {
+    "dev": "nodemon --watch . --ext js,json --signal SIGINT server.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "archiver": "^7.0.1",
+    "async-mutex": "^0.5.0",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.1.5",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "lowdb": "^7.0.1",
+    "multer": "^1.4.5-lts.1",
+    "nanoid": "^5.0.7",
+    "node-fetch": "^3.3.2",
+    "nodemailer": "^6.9.14",
+    "unzipper": "^0.11.6"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  }
+}
