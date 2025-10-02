@@ -983,13 +983,23 @@ app.get("/", (req, res) =>
 );
 
 /* ---------- Serve built SPA (web/dist) ---------- */
-// mount AFTER all /api routes and BEFORE the /api 404
-const clientDir = path.join(__dirname, "../web/dist");
-app.use(express.static(clientDir));
-// SPA fallback for any non-API route (e.g. /admin, /library, etc.)
-app.get(/^(?!\/api).+/, (req, res) => {
-  res.sendFile(path.join(clientDir, "index.html"));
-});
+/* On Render we deploy API-only. The frontend is on Netlify.
+   Only try to serve the built SPA if the files actually exist. */
+
+const clientDir = process.env.CLIENT_DIR || path.join(__dirname, "../web/dist");
+const clientIndex = path.join(clientDir, "index.html");
+
+if (fs.existsSync(clientIndex)) {
+  // If you DID build the SPA into web/dist, serve it.
+  app.use(express.static(clientDir));
+  app.get(/^(?!\/api).+/, (req, res) => res.sendFile(clientIndex));
+} else {
+  // If not, be friendly and point people to the frontend host.
+  app.get(/^(?!\/api).+/, (req, res) => {
+    res.status(200).send("Frontend is hosted separately. Visit the Netlify site.");
+  });
+}
+
 
 /* ------------ FINAL: /api catch-all 404 (LAST) ------------ */
 app.use("/api", (req, res) => {
