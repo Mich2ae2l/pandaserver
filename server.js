@@ -1,4 +1,4 @@
-// server.js - cleaned + batch upload fixes (replace your existing file)
+// server.js - Supabase-enabled version (replace your existing file)
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -18,6 +18,7 @@ import { nanoid } from "nanoid";
 import { fileURLToPath } from "url";
 import archiver from "archiver";
 import unzipper from "unzipper";
+import { createClient } from "@supabase/supabase-js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -36,13 +37,8 @@ app.use(
 );
 
 // CORS allow-list via env CORS_ORIGINS (comma-separated).
-// If you don't set CORS_ORIGINS, keep a friendly default set for local dev + your Netlify site.
-// Replace or add domains in your environment for production.
 const RAW_ALLOWED = process.env.CORS_ORIGINS || "http://localhost:5173,https://sprightly-cannoli-74fc49.netlify.app";
-const ALLOWED = RAW_ALLOWED
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+const ALLOWED = RAW_ALLOWED.split(",").map((s) => s.trim()).filter(Boolean);
 
 const corsOptions = {
   origin: (origin, cb) => {
@@ -79,7 +75,7 @@ app.use("/files", express.static(PDF_DIR, {
   },
 }));
 
-/* ---------------- DB ---------------- */
+/* ---------------- DB (LowDB fallback) ---------------- */
 const db = new Low(new JSONFile(DB_FILE), {
   users: [],
   pdfs: [],
@@ -93,6 +89,74 @@ await db.read();
 db.data ||= { users: [], pdfs: [], transactions: [], downloadTokens: [], resetTokens: [], inbox: [], chats: [] };
 if (!Array.isArray(db.data.inbox)) db.data.inbox = [];
 if (!Array.isArray(db.data.chats)) db.data.chats = [];
+
+/* ---------------- Supabase init & helpers ---------------- */
+const SUPABASE_URL = process.env.SUPABASE_URL || "";
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+const SUPABASE_TABLE = process.env.SUPABASE_TABLE || "pdfs";
+let supabase = null;
+if (SUPABASE_URL && SUPABASE_KEY) {
+  supabase = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } });
+}
+
+/**
+ * Supabase helpers (minimal wrappers)
+ */
+async function insertPdfToDb(item) {
+  if (!supabase) throw new Error("Supabase client not configured");
+  const { data, error } = await supabase.from(SUPABASE_TABLE).insert([item]).select().single();
+  if (error) throw error;
+  return data;
+}
+
+async function updatePdfInDb(id, patch) {
+  if (!supabase) throw new Error("Supabase client not configured");
+  const { data, error } = await supabase.from(SUPABASE_TABLE).update(patch).eq("id", id).select().single();
+  if (error) throw error;
+  return data;
+}
+
+async function deletePdfRowFromDb(id) {
+  if (!supabase) throw new Error("Supabase client not configured");
+  const { error } = await supabase.from(SUPABASE_TABLE).delete().eq("id", id);
+  if (error) throw error;
+  return true;
+}
+
+async function fetchPdfByIdFromDb(id) {
+  if (!supabase) throw new Error("Supabase client not configured");
+  const { data, error } = await supabase.from(SUPABASE_TABLE).select("*").eq("id", id).single();
+  if (error) {
+    // Normalize not-found
+    if (error.code === "PGRST116" || error.status === 406 || error.status === 404 || /No rows/.test(String(error.message || ""))) return null;
+    throw error;
+  }
+  return data;
+}
+
+/**
+ * Query pdfs with basic filters + pagination
+ * returns { total, items }
+ */
+async function queryPdfsFromDb({ state, year_min = null, year_max = null, page = 1, per_page = 100, status = "unsold", q = "" } = {}) {
+  if (!supabase) throw new Error("Supabase client not configured");
+  const pg = Math.max(Number(page) || 1, 1);
+  const pp = Math.min(Math.max(Number(per_page) || 100, 1), 500);
+
+  let query = supabase.from(SUPABASE_TABLE).select("*", { count: "exact" });
+
+  if (status) query = query.eq("status", status);
+  if (state) query = query.eq("state", String(state).toUpperCase());
+  if (year_min != null) query = query.gte("year", Number(year_min));
+  if (year_max != null) query = query.lte("year", Number(year_max));
+  if (q) query = query.ilike("title", `%${q}%`);
+
+  const from = (pg - 1) * pp;
+  const to = from + pp - 1;
+  const { data, count, error } = await query.range(from, to);
+  if (error) throw error;
+  return { total: count || (data ? data.length : 0), items: data || [] };
+}
 
 /* ---------------- Helpers ---------------- */
 const PRICE_CENTS = 499;
@@ -121,14 +185,11 @@ const US_STATES = new Set([
   "MS","MO","MT","NE","NV","NH","NJ","NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT","VA",
   "WA","WV","WI","WY"
 ]);
-/* ---------------- filename parsing ---------------- */
-// US_STATES set remains the same (keep your existing US_STATES variable)
 
 function parseFilenameMeta(originalName) {
-  // normalize
   const base = String(originalName).replace(/\.(pdf|png|jpg|jpeg)$/i, "").trim();
 
-  // 1) Try the old Title_State_YYYY pattern (keeps backward compatibility)
+  // 1) Title_State_YYYY
   {
     const rx = /^(.*?)\s*[-_ ]+([A-Za-z]{2})\s*[-_ ]+(200[0-7])(?:\D|$)/i;
     const m = base.match(rx);
@@ -143,22 +204,16 @@ function parseFilenameMeta(originalName) {
     }
   }
 
-  // 2) Accept First_Last_YYYY or First_Last_YYYYMMDD or First_M_Last_YYYYMMDD
-  // Split on underscores
   const parts = base.split("_").map((p) => p.trim()).filter(Boolean);
   if (parts.length >= 3) {
-    // last part might be 8-digit DOB or 4-digit year
     const lastPart = parts[parts.length - 1];
 
-    // CASE A: dob 8 digits (YYYYMMDD or YYYYDDMM) -> parse using similar rules
     if (/^\d{8}$/.test(lastPart)) {
-      // Build name pieces
       const nameParts = parts.slice(0, parts.length - 1);
       if (nameParts.length >= 2) {
         const first = cap(nameParts[0]);
         const last = cap(nameParts[nameParts.length - 1]);
         const middle = nameParts.length === 3 ? cap(nameParts[1]) : undefined;
-
         const y = lastPart.slice(0, 4);
         const a = lastPart.slice(4, 6);
         const b = lastPart.slice(6, 8);
@@ -168,7 +223,6 @@ function parseFilenameMeta(originalName) {
           const mmStr = String(mm).padStart(2, "0");
           const ddStr = String(dd).padStart(2, "0");
           const iso = `${y}-${mmStr}-${ddStr}`;
-          // final validation
           const dt = new Date(iso);
           if (!Number.isNaN(dt.getTime())) {
             return {
@@ -183,26 +237,19 @@ function parseFilenameMeta(originalName) {
       }
     }
 
-    // CASE B: last part is 4-digit year and one of the middle parts is 2-letter state:
-    // Examples: First_Last_CA_2005 or first_last_state_2005
     if (/^\d{4}$/.test(lastPart)) {
       const possibleYear = Number(lastPart);
       if (possibleYear >= 1900 && possibleYear <= 2100) {
-        // find a two-letter US state among the middle parts
         for (let i = 1; i < parts.length - 1; i++) {
           const candidate = parts[i].toUpperCase();
           if (US_STATES.has(candidate)) {
-            const first = cap(parts[0]);
-            const last = cap(parts[parts.length - 1 === i ? parts.length - 2 : parts.length - 1]);
-            // if state is in the middle, we consider name everything before state
             const nameParts = parts.slice(0, i);
             const nameFirst = cap(nameParts[0]);
-            const nameLast = cap(nameParts[nameParts.length - 1] || last);
+            const nameLast = cap(nameParts[nameParts.length - 1] || parts[1]);
             const title = `${nameFirst} ${nameLast}`.trim();
             return { title, state: candidate, year: possibleYear };
           }
         }
-        // If no state found, fall back to treating first two parts as first/last and lastPart as year
         if (parts.length >= 2) {
           const first = cap(parts[0]);
           const last = cap(parts[1]);
@@ -211,8 +258,6 @@ function parseFilenameMeta(originalName) {
       }
     }
   }
-
-  // If nothing matched:
   return null;
 }
 
@@ -220,7 +265,6 @@ function cap(s) {
   if (!s) return "";
   return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
 }
-
 
 /* ---------------- Auth guards ---------------- */
 function requireAuth(req, res, next) {
@@ -264,7 +308,7 @@ function pushMessage({ user_id, from, text }) {
   return msg;
 }
 
-/* ---------------- Auth ---------------- */
+/* ---------------- Auth (register/login/me) ---------------- */
 app.post("/api/auth/register", async (req, res) => {
   const { name, email, password } = req.body || {};
   if (!name || !email || !password) return res.status(400).json({ error: "name, email, password required" });
@@ -347,46 +391,92 @@ app.post("/api/auth/reset", async (req, res) => {
   res.json({ ok: true });
 });
 
-/* ------------- Storefront ------------- */
-app.get("/api/pdfs", (req, res) => {
-  const { state, year_min, year_max, page = 1, per_page = 100 } = req.query;
-  let items = db.data.pdfs.filter((p) => p.status === "unsold");
-  if (state) items = items.filter((p) => p.state?.toLowerCase() === String(state).toLowerCase());
-  const yMin = year_min ? Number(year_min) : 2000;
-  const yMax = year_max ? Number(year_max) : 2007;
-  items = items.filter((p) => Number(p.year) >= yMin && Number(p.year) <= yMax);
-  const pp = Math.min(Math.max(Number(per_page), 1), 500);
-  const pg = Math.max(Number(page), 1);
-  const total = items.length;
-  const start = (pg - 1) * pp;
-  res.json({
-    total,
-    page: pg,
-    per_page: pp,
-    items: items.slice(start, start + pp).map((p) => ({
-      id: p.id, title: p.title, state: p.state, year: p.year, price_cents: PRICE_CENTS,
-    })),
-  });
+/* ------------- Storefront (prefer Supabase, fallback LowDB) ------------- */
+app.get("/api/pdfs", async (req, res) => {
+  try {
+    if (supabase) {
+      const { state, year_min, year_max, page = 1, per_page = 100, q = "" } = req.query;
+      const result = await queryPdfsFromDb({
+        state,
+        year_min: year_min ? Number(year_min) : null,
+        year_max: year_max ? Number(year_max) : null,
+        page: Number(page), per_page: Number(per_page), status: "unsold", q
+      });
+      const items = (result.items || []).map((p) => ({ id: p.id, title: p.title, state: p.state, year: p.year, price_cents: p.price_cents ?? PRICE_CENTS }));
+      return res.json({ total: result.total, page: Number(req.query.page || 1), per_page: Number(req.query.per_page || 100), items });
+    }
+
+    // fallback LowDB
+    const { state, year_min, year_max, page = 1, per_page = 100 } = req.query;
+    let items = db.data.pdfs.filter((p) => p.status === "unsold");
+    if (state) items = items.filter((p) => p.state?.toLowerCase() === String(state).toLowerCase());
+    const yMin = year_min ? Number(year_min) : 2000;
+    const yMax = year_max ? Number(year_max) : 2007;
+    items = items.filter((p) => Number(p.year) >= yMin && Number(p.year) <= yMax);
+    const pp = Math.min(Math.max(Number(per_page), 1), 500);
+    const pg = Math.max(Number(page), 1);
+    const total = items.length;
+    const start = (pg - 1) * pp;
+    res.json({
+      total,
+      page: pg,
+      per_page: pp,
+      items: items.slice(start, start + pp).map((p) => ({ id: p.id, title: p.title, state: p.state, year: p.year, price_cents: PRICE_CENTS })),
+    });
+  } catch (e) {
+    console.error("GET /api/pdfs error:", e);
+    res.status(500).json({ error: "Failed to fetch PDFs" });
+  }
 });
 
-app.get("/api/inventory/count", (req, res) => {
-  res.json({ remaining: db.data.pdfs.filter((p) => p.status === "unsold").length });
+app.get("/api/inventory/count", async (req, res) => {
+  try {
+    if (supabase) {
+      const { data, count, error } = await supabase.from(SUPABASE_TABLE).select("id", { count: "exact" }).eq("status", "unsold");
+      if (error) throw error;
+      return res.json({ remaining: count || (data ? data.length : 0) });
+    }
+    return res.json({ remaining: db.data.pdfs.filter((p) => p.status === "unsold").length });
+  } catch (e) {
+    console.error("inventory count supabase error:", e);
+    return res.json({ remaining: db.data.pdfs.filter((p) => p.status === "unsold").length });
+  }
 });
 
 // richer library + alias
-app.get("/api/me/library", requireAuth, (req, res) => {
-  const owned = db.data.pdfs
-    .filter((p) => p.buyer_user_id === req.user.id)
-    .sort((a, b) => new Date(b.sold_at || 0) - new Date(a.sold_at || 0))
-    .map((p) => ({ id: p.id, title: p.title, state: p.state, year: p.year, price_cents: PRICE_CENTS }));
-  res.json({ items: owned });
+app.get("/api/me/library", requireAuth, async (req, res) => {
+  try {
+    if (supabase) {
+      const { data, error } = await supabase.from(SUPABASE_TABLE).select("*").eq("buyer_user_id", req.user.id).order("sold_at", { ascending: false });
+      if (error) throw error;
+      return res.json({ items: (data || []).map(p => ({ id: p.id, title: p.title, state: p.state, year: p.year, price_cents: p.price_cents })) });
+    }
+    const owned = db.data.pdfs
+      .filter((p) => p.buyer_user_id === req.user.id)
+      .sort((a, b) => new Date(b.sold_at || 0) - new Date(a.sold_at || 0))
+      .map((p) => ({ id: p.id, title: p.title, state: p.state, year: p.year, price_cents: PRICE_CENTS }));
+    res.json({ items: owned });
+  } catch (e) {
+    console.error("/api/me/library error:", e);
+    res.status(500).json({ error: "Failed to fetch library" });
+  }
 });
-app.get("/api/library", requireAuth, (req, res) => {
-  const owned = db.data.pdfs
-    .filter((p) => p.buyer_user_id === req.user.id)
-    .sort((a, b) => new Date(b.sold_at || 0) - new Date(a.sold_at || 0))
-    .map((p) => ({ id: p.id, title: p.title, state: p.state, year: p.year, price_cents: PRICE_CENTS }));
-  res.json({ items: owned });
+app.get("/api/library", requireAuth, async (req, res) => {
+  try {
+    if (supabase) {
+      const { data, error } = await supabase.from(SUPABASE_TABLE).select("*").eq("buyer_user_id", req.user.id).order("sold_at", { ascending: false });
+      if (error) throw error;
+      return res.json({ items: (data || []).map(p => ({ id: p.id, title: p.title, state: p.state, year: p.year, price_cents: p.price_cents })) });
+    }
+    const owned = db.data.pdfs
+      .filter((p) => p.buyer_user_id === req.user.id)
+      .sort((a, b) => new Date(b.sold_at || 0) - new Date(a.sold_at || 0))
+      .map((p) => ({ id: p.id, title: p.title, state: p.state, year: p.year, price_cents: PRICE_CENTS }));
+    res.json({ items: owned });
+  } catch (e) {
+    console.error("/api/library error:", e);
+    res.status(500).json({ error: "Failed to fetch library" });
+  }
 });
 
 /* ------------- NOWPayments ------------- */
@@ -470,7 +560,7 @@ app.post("/api/now/webhook", express.json({ type: "*/*" }), async (req, res) => 
 
 /* ------------- Purchasing ------------- */
 
-// Bulk purchase (keep first)
+// Bulk purchase (supports Supabase + LowDB)
 app.post("/api/purchase/bulk", requireAuth, async (req, res) => {
   const release = await mutex.acquire();
   try {
@@ -488,7 +578,12 @@ app.post("/api/purchase/bulk", requireAuth, async (req, res) => {
     const skipped_ids = [];
 
     for (const id of ids) {
-      const pdf = db.data.pdfs.find((p) => p.id === id);
+      // fetch pdf from supabase first, fallback to local
+      let pdf = null;
+      if (supabase) {
+        try { pdf = await fetchPdfByIdFromDb(id); } catch (e) { console.error("fetchPdfByIdFromDb error:", e); }
+      }
+      if (!pdf) pdf = db.data.pdfs.find((p) => p.id === id);
 
       if (!pdf || pdf.status !== "unsold") {
         skipped_ids.push({ id, reason: "Not available" });
@@ -500,9 +595,28 @@ app.post("/api/purchase/bulk", requireAuth, async (req, res) => {
         continue;
       }
 
-      pdf.status = "sold";
-      pdf.buyer_user_id = user.id;
-      pdf.sold_at = nowISO();
+      // Update Supabase (if present)
+      const sold_at = nowISO();
+      if (supabase) {
+        try {
+          await updatePdfInDb(pdf.id, { status: "sold", buyer_user_id: user.id, sold_at });
+        } catch (e) {
+          console.error("Failed to update pdf sold state in Supabase:", e);
+        }
+      }
+
+      // Ensure local cache exists and update
+      let localPdf = db.data.pdfs.find((p) => p.id === pdf.id);
+      if (!localPdf) {
+        // insert a cache copy so UI/local flows work
+        localPdf = { id: pdf.id, title: pdf.title || "", state: pdf.state || null, year: pdf.year || null, file_name: pdf.file_name || null, price_cents: pdf.price_cents || PRICE_CENTS, status: "sold", buyer_user_id: user.id, sold_at };
+        db.data.pdfs.push(localPdf);
+      } else {
+        localPdf.status = "sold";
+        localPdf.buyer_user_id = user.id;
+        localPdf.sold_at = sold_at;
+      }
+
       if (!isAdmin) balance -= PRICE_CENTS;
 
       db.data.transactions.push({
@@ -535,7 +649,13 @@ app.post("/api/purchase/single/:pdfId", requireAuth, async (req, res) => {
   const release = await mutex.acquire();
   try {
     await db.read();
-    const pdf = db.data.pdfs.find((p) => p.id === String(req.params.pdfId));
+
+    // attempt fetch from Supabase first
+    let pdf = null;
+    if (supabase) {
+      try { pdf = await fetchPdfByIdFromDb(String(req.params.pdfId)); } catch (e) { console.error("fetchPdfByIdFromDb error:", e); }
+    }
+    if (!pdf) pdf = db.data.pdfs.find((p) => p.id === String(req.params.pdfId));
     if (!pdf || pdf.status !== "unsold") return res.status(404).json({ error: "PDF not available" });
 
     const user = db.data.users.find((u) => u.id === req.user.id);
@@ -546,9 +666,24 @@ app.post("/api/purchase/single/:pdfId", requireAuth, async (req, res) => {
       user.balance_cents = (user.balance_cents || 0) - PRICE_CENTS;
     }
 
-    pdf.status = "sold";
-    pdf.buyer_user_id = user.id;
-    pdf.sold_at = nowISO();
+    const sold_at = nowISO();
+
+    // update supabase if present
+    if (supabase) {
+      try {
+        await updatePdfInDb(pdf.id, { status: "sold", buyer_user_id: user.id, sold_at });
+      } catch (e) { console.error("Failed to update pdf sold state in Supabase:", e); }
+    }
+
+    // ensure local cache updated
+    const localPdf = db.data.pdfs.find((p) => p.id === pdf.id);
+    if (localPdf) {
+      localPdf.status = "sold";
+      localPdf.buyer_user_id = user.id;
+      localPdf.sold_at = sold_at;
+    } else {
+      db.data.pdfs.push({ id: pdf.id, title: pdf.title || "", state: pdf.state || null, year: pdf.year || null, file_name: pdf.file_name || null, price_cents: pdf.price_cents || PRICE_CENTS, status: "sold", buyer_user_id: user.id, sold_at });
+    }
 
     db.data.transactions.push({
       id: nanoid(),
@@ -569,15 +704,20 @@ app.post("/api/purchase/single/:pdfId", requireAuth, async (req, res) => {
 });
 
 /* ------------- Downloads ------------- */
-app.post("/api/download/token/:pdfId", requireAuth, (req, res) => {
-  const pdf = db.data.pdfs.find((p) => p.id === req.params.pdfId);
+app.post("/api/download/token/:pdfId", requireAuth, async (req, res) => {
+  await db.read();
+  let pdf = null;
+  if (supabase) {
+    try { pdf = await fetchPdfByIdFromDb(req.params.pdfId); } catch (e) { console.error("fetchPdfByIdFromDb error:", e); }
+  }
+  if (!pdf) pdf = db.data.pdfs.find((p) => p.id === req.params.pdfId);
   if (!pdf) return res.status(404).json({ error: "Not found" });
   if (!req.user.is_admin && pdf.buyer_user_id !== req.user.id) return res.status(403).json({ error: "Purchase required" });
 
   const token = nanoid();
   const expires_at = Date.now() + 5 * 60 * 1000;
   db.data.downloadTokens.push({ token, user_id: req.user.id, pdf_id: pdf.id, expires_at });
-  saveDb();
+  await saveDb();
 
   const url = `${publicBase(req)}/api/download/${token}`;
   res.json({ token, expires_at, url });
@@ -585,21 +725,18 @@ app.post("/api/download/token/:pdfId", requireAuth, (req, res) => {
 
 app.get("/api/admin/pdfs/:id/download", requireAuth, requireAdmin, async (req, res) => {
   try {
-    // Always load the latest DB state
     await db.read();
-    db.data.pdfs ||= [];
 
-    const pdf = db.data.pdfs.find((p) => p.id === req.params.id);
-    if (!pdf) {
-      return res.status(404).json({ error: "Not found" });
+    let pdf = null;
+    if (supabase) {
+      try { pdf = await fetchPdfByIdFromDb(req.params.id); } catch (e) { console.error("fetchPdfByIdFromDb error:", e); }
     }
+    if (!pdf) pdf = db.data.pdfs.find((p) => p.id === req.params.id);
+    if (!pdf) return res.status(404).json({ error: "Not found" });
 
     const file = path.join(PDF_DIR, pdf.file_name);
-    if (!fs.existsSync(file)) {
-      return res.status(404).json({ error: "File missing" });
-    }
+    if (!fs.existsSync(file)) return res.status(404).json({ error: "File missing" });
 
-    // set headers and send
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", `attachment; filename="${pdf.file_name}"`);
     fs.createReadStream(file).pipe(res);
@@ -609,12 +746,16 @@ app.get("/api/admin/pdfs/:id/download", requireAuth, requireAdmin, async (req, r
   }
 });
 
-
-app.get("/api/download/:token", (req, res) => {
+app.get("/api/download/:token", async (req, res) => {
+  await db.read();
   const tok = db.data.downloadTokens.find((t) => t.token === req.params.token);
   if (!tok || Date.now() > tok.expires_at) return res.status(410).json({ error: "Expired token" });
 
-  const pdf = db.data.pdfs.find((p) => p.id === tok.pdf_id);
+  let pdf = null;
+  if (supabase) {
+    try { pdf = await fetchPdfByIdFromDb(tok.pdf_id); } catch (e) { console.error("fetchPdfByIdFromDb error:", e); }
+  }
+  if (!pdf) pdf = db.data.pdfs.find((p) => p.id === tok.pdf_id);
   if (!pdf) return res.status(404).json({ error: "Not found" });
 
   const file = path.join(PDF_DIR, pdf.file_name);
@@ -623,11 +764,11 @@ app.get("/api/download/:token", (req, res) => {
   res.setHeader("Content-Type", "application/octet-stream");
   const asAttachment = String(req.query.dl || "") === "1";
   const disp = asAttachment ? "attachment" : "inline";
-  res.setHeader("Content-Disposition", `${disp}; filename="${(pdf.title || pdf.id).replace(/[^a-z0-9_\-\.]+/gi, "_")}.pdf"`);
+  res.setHeader("Content-Disposition", `${disp}; filename="${(pdf.title || pdf.id).replace(/[^a-z0-9_\\-\\.]+/gi, "_")}.pdf"`);
 
   fs.createReadStream(file).pipe(res);
   db.data.downloadTokens = db.data.downloadTokens.filter((t) => t.token !== tok.token);
-  saveDb();
+  await saveDb();
 });
 
 /* === ZIP download of purchased PDFs === */
@@ -653,7 +794,7 @@ app.post("/api/download/zip", requireAuth, async (req, res) => {
     for (const p of rows) {
       const fp = path.join(PDF_DIR, p.file_name);
       if (!p.file_name || !fs.existsSync(fp)) continue;
-      const nice = `${(p.title || p.id).replace(/[^a-z0-9_\-\.]+/gi, "_")}.pdf`;
+      const nice = `${(p.title || p.id).replace(/[^a-z0-9_\\-\\.]+/gi, "_")}.pdf`;
       archive.file(fp, { name: nice });
       added++;
     }
@@ -716,7 +857,7 @@ app.get("/api/admin/metrics/rich", requireAuth, requireAdmin, (req, res) => {
   });
 });
 
-// Users
+// Users list / patch / delete (unchanged behavior)
 app.get("/api/admin/users", requireAuth, requireAdmin, (req, res) => {
   let { page = 1, per_page = 50, q = "" } = req.query;
   page = Math.max(Number(page) || 1, 1);
@@ -766,29 +907,39 @@ app.get("/api/admin/transactions", requireAuth, requireAdmin, (req, res) => {
   res.json({ items: db.data.transactions.slice().reverse().slice(0, 500) });
 });
 
-// FAST admin list
-app.get("/api/admin/pdfs", requireAuth, requireAdmin, (req, res) => {
-  let { page = 1, per_page = 60, q = "", state = "", status = "", year_min, year_max } = req.query;
-  page = Math.max(Number(page) || 1, 1);
-  per_page = Math.min(Math.max(Number(per_page) || 60, 1), 500);
+// FAST admin list - prefer Supabase
+app.get("/api/admin/pdfs", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    if (supabase) {
+      const { page = 1, per_page = 60, q = "", state = "", status = "", year_min = null, year_max = null } = req.query;
+      const result = await queryPdfsFromDb({ state: state || null, year_min: year_min ? Number(year_min) : null, year_max: year_max ? Number(year_max) : null, page: Number(page), per_page: Number(per_page), status: status || null, q: q || "" });
+      const items = (result.items || []).map((p) => ({ id: p.id, title: p.title, state: p.state, year: p.year, status: p.status, created_at: p.created_at, file_name: p.file_name }));
+      return res.json({ total: result.total, page: Number(page), per_page: Number(per_page), items });
+    }
 
-  let items = db.data.pdfs.slice();
-  if (q) {
-    const needle = String(q).toLowerCase();
-    items = items.filter((p) => String(p.title || "").toLowerCase().includes(needle) || String(p.state || "").toLowerCase().includes(needle));
+    let { page = 1, per_page = 60, q = "", state = "", status = "", year_min, year_max } = req.query;
+    page = Math.max(Number(page) || 1, 1);
+    per_page = Math.min(Math.max(Number(per_page) || 60, 1), 500);
+
+    let items = db.data.pdfs.slice();
+    if (q) {
+      const needle = String(q).toLowerCase();
+      items = items.filter((p) => String(p.title || "").toLowerCase().includes(needle) || String(p.state || "").toLowerCase().includes(needle));
+    }
+    if (state) { items = items.filter((p) => String(p.state || "").toLowerCase() === String(state).toLowerCase()); }
+    if (status) { items = items.filter((p) => String(p.status || "") === String(status)); }
+    const yMin = year_min ? Number(year_min) : 2000;
+    const yMax = year_max ? Number(year_max) : 2007;
+    items = items.filter((p) => Number(p.year) >= yMin && Number(p.year) <= yMax);
+
+    const total = items.length;
+    const start = (page - 1) * per_page;
+    const pageItems = items.slice(start, start + per_page).map((p) => ({ id: p.id, title: p.title, state: p.state, year: p.year, status: p.status, created_at: p.created_at, file_name: p.file_name }));
+    res.json({ total, page, per_page, items: pageItems });
+  } catch (e) {
+    console.error("/api/admin/pdfs error:", e);
+    res.status(500).json({ error: "Failed to list PDFs" });
   }
-  if (state) { items = items.filter((p) => String(p.state || "").toLowerCase() === String(state).toLowerCase()); }
-  if (status) { items = items.filter((p) => String(p.status || "") === String(status)); }
-  const yMin = year_min ? Number(year_min) : 2000;
-  const yMax = year_max ? Number(year_max) : 2007;
-  items = items.filter((p) => Number(p.year) >= yMin && Number(p.year) <= yMax);
-
-  const total = items.length;
-  const start = (page - 1) * per_page;
-  const pageItems = items.slice(start, start + per_page).map((p) => ({
-    id: p.id, title: p.title, state: p.state, year: p.year, status: p.status, created_at: p.created_at, file_name: p.file_name,
-  }));
-  res.json({ total, page, per_page, items: pageItems });
 });
 
 /* ================== ADMIN PDF DELETION (helpers & routes) ================== */
@@ -804,6 +955,16 @@ async function removePdfById(id) {
     }
   } catch {}
   db.data.downloadTokens = db.data.downloadTokens.filter((t) => t.pdf_id !== p.id);
+
+  // delete row in supabase if configured
+  if (supabase) {
+    try {
+      await deletePdfRowFromDb(p.id);
+    } catch (e) {
+      console.error("Warning: failed to delete pdf row from Supabase:", e?.message || e);
+    }
+  }
+
   db.data.pdfs.splice(idx, 1);
   await db.write();
   return { ok: true, id };
@@ -849,7 +1010,7 @@ app.post("/api/admin/pdfs/:id/delete", requireAuth, requireAdmin, async (req, re
 /* ---------- Uploads ---------- */
 const uploadAny = uploadM.any();
 
-// Single PDF upload (admin)
+// Single PDF upload (admin) - now inserts to Supabase metadata as well
 app.post("/api/admin/pdf", requireAuth, requireAdmin, uploadSingleFlexible, async (req, res) => {
   try {
     await db.read();
@@ -869,13 +1030,41 @@ app.post("/api/admin/pdf", requireAuth, requireAdmin, uploadSingleFlexible, asyn
       await fs.promises.unlink(up.path);
     }
 
-    const item = {
-      id: nanoid(), title, state: String(state).toUpperCase(), year: Number(year),
-      price_cents: PRICE_CENTS, status: "unsold", file_name: filename, created_at: nowISO(),
+    // canonical item row to insert into Supabase
+    const itemRow = {
+      title,
+      state: String(state).toUpperCase(),
+      year: Number(year),
+      price_cents: PRICE_CENTS,
+      status: "unsold",
+      file_name: filename,
+      created_at: nowISO(),
     };
-    db.data.pdfs.push(item);
-    await saveDb();
-    res.json({ ok: true, pdf: { id: item.id, title: item.title } });
+
+    if (supabase) {
+      try {
+        const created = await insertPdfToDb(itemRow);
+        // push a local cache entry using the Supabase id
+        const item = { id: created.id, ...itemRow };
+        db.data.pdfs.push(item);
+        await saveDb();
+        return res.json({ ok: true, pdf: { id: item.id, title: item.title } });
+      } catch (e) {
+        console.error("Failed to insert pdf row into Supabase:", e);
+        // cleanup uploaded file to avoid orphan files if you don't want them:
+        // try { if (fs.existsSync(dest)) await fs.promises.unlink(dest); } catch (unlinkErr) { console.error("Failed to unlink file after DB insert failure:", unlinkErr); }
+        // Fallback to LowDB so admin still sees it (keeps behavior safe)
+        const item = { id: nanoid(), ...itemRow };
+        db.data.pdfs.push(item);
+        await saveDb();
+        return res.status(500).json({ error: "Uploaded file but failed to save metadata to Supabase (fallback saved locally)" });
+      }
+    } else {
+      const item = { id: nanoid(), ...itemRow };
+      db.data.pdfs.push(item);
+      await saveDb();
+      return res.json({ ok: true, pdf: { id: item.id, title: item.title } });
+    }
   } catch (e) {
     console.error("Single upload failed:", e);
     try { if (req.files) for (const f of Object.values(req.files).flat()) { if (f?.path && fs.existsSync(f.path)) fs.unlinkSync(f.path); } } catch {}
@@ -883,62 +1072,42 @@ app.post("/api/admin/pdf", requireAuth, requireAdmin, uploadSingleFlexible, asyn
   }
 });
 
-// Batch upload: multiple individual files (multipart form)
+// Batch upload
 app.post("/api/admin/pdf-batch", requireAuth, requireAdmin, uploadAny, async (req, res) => {
   const release = await mutex.acquire();
   const results = { created: [], skipped: [], errors: [] };
 
   try {
     await db.read();
-    db.data.pdfs ||= []; // ✅ Ensure array is always defined
+    db.data.pdfs ||= [];
 
     const files = Array.isArray(req.files) ? req.files : [];
 
     for (const file of files) {
       try {
-        // only allow PDF or image
         if (!/\.(pdf|png|jpg|jpeg)$/i.test(file.originalname)) {
-          results.skipped.push({
-            file: file.originalname,
-            reason: "Not a supported doc",
-          });
-          try {
-            if (file?.path && fs.existsSync(file.path)) {
-              await fs.promises.unlink(file.path);
-            }
-          } catch {}
+          results.skipped.push({ file: file.originalname, reason: "Not a supported doc" });
+          try { if (file?.path && fs.existsSync(file.path)) await fs.promises.unlink(file.path); } catch {}
           continue;
         }
 
-        // parse filename metadata
         const meta = parseFilenameMeta(file.originalname);
         if (!meta) {
-          results.skipped.push({
-            file: file.originalname,
-            reason: "Could not parse Title/State/Year",
-          });
-          try {
-            if (file?.path && fs.existsSync(file.path)) {
-              await fs.promises.unlink(file.path);
-            }
-          } catch {}
+          results.skipped.push({ file: file.originalname, reason: "Could not parse Title/State/Year" });
+          try { if (file?.path && fs.existsSync(file.path)) await fs.promises.unlink(file.path); } catch {}
           continue;
         }
 
-        // rename or copy file into storage
         const filename = nanoid() + path.extname(file.originalname).toLowerCase();
         const dest = path.join(PDF_DIR, filename);
         try {
           await fs.promises.rename(file.path, dest);
         } catch (err) {
-          // fallback if rename across devices fails
           await fs.promises.copyFile(file.path, dest);
           await fs.promises.unlink(file.path);
         }
 
-        // store in DB
-        const item = {
-          id: nanoid(),
+        const itemRow = {
           title: meta.title,
           state: meta.state,
           year: meta.year,
@@ -948,23 +1117,27 @@ app.post("/api/admin/pdf-batch", requireAuth, requireAdmin, uploadAny, async (re
           created_at: nowISO(),
         };
 
-        db.data.pdfs.push(item); // ✅ safe now
-        results.created.push({
-          file: file.originalname,
-          parsed: meta,
-          id: item.id,
-        });
+        if (supabase) {
+          try {
+            const created = await insertPdfToDb(itemRow);
+            const item = { id: created.id, ...itemRow };
+            db.data.pdfs.push(item);
+            results.created.push({ file: file.originalname, parsed: meta, id: item.id });
+          } catch (e) {
+            console.error("Failed to insert batch pdf into Supabase:", e);
+            const item = { id: nanoid(), ...itemRow };
+            db.data.pdfs.push(item);
+            results.created.push({ file: file.originalname, parsed: meta, id: item.id, fallback: true });
+          }
+        } else {
+          const item = { id: nanoid(), ...itemRow };
+          db.data.pdfs.push(item);
+          results.created.push({ file: file.originalname, parsed: meta, id: item.id });
+        }
       } catch (e) {
         console.error("Batch upload error for", file?.originalname, e);
-        results.errors.push({
-          file: file?.originalname || "unknown",
-          error: String(e?.message || e),
-        });
-        try {
-          if (file?.path && fs.existsSync(file.path)) {
-            await fs.promises.unlink(file.path);
-          }
-        } catch {}
+        results.errors.push({ file: file?.originalname || "unknown", error: String(e?.message || e) });
+        try { if (file?.path && fs.existsSync(file.path)) await fs.promises.unlink(file.path); } catch {}
       }
     }
 
@@ -986,7 +1159,6 @@ app.post("/api/admin/pdf-batch-zip", requireAuth, requireAdmin, uploadZip, async
   try {
     if (!req.file) return res.status(400).json({ error: "zip file required (field 'zip')" });
 
-    // ensure DB is loaded and arrays exist (prevents .push on undefined)
     await db.read();
     db.data ||= {};
     db.data.pdfs ||= [];
@@ -994,13 +1166,11 @@ app.post("/api/admin/pdf-batch-zip", requireAuth, requireAdmin, uploadZip, async
     const results = { created: [], skipped: [], errors: [] };
     const zipPath = req.file.path;
 
-    // Attempt to open the uploaded zip
     let directory;
     try {
       directory = await unzipper.Open.file(zipPath);
     } catch (err) {
       console.error("Failed to open uploaded ZIP:", err);
-      // cleanup uploaded zip
       try { if (zipPath && fs.existsSync(zipPath)) await fs.promises.unlink(zipPath); } catch {}
       return res.status(400).json({ error: "Invalid ZIP file" });
     }
@@ -1013,14 +1183,21 @@ app.post("/api/admin/pdf-batch-zip", requireAuth, requireAdmin, uploadZip, async
         const basename = path.basename(originalname);
         const ext = path.extname(basename).toLowerCase();
 
-        // Acceptable extensions
         if (![".pdf", ".png", ".jpg", ".jpeg"].includes(ext)) {
           results.skipped.push({ file: originalname, reason: "Unsupported file in zip" });
           continue;
         }
 
+        const meta = parseFilenameMeta(basename);
+        if (!meta) {
+          results.skipped.push({ file: originalname, reason: "Could not parse Title/State/Year" });
+          continue;
+        }
 
-        // stream to file and wait
+        const filename = nanoid() + ext;
+        const dest = path.join(PDF_DIR, filename);
+
+        // stream entry to file
         await new Promise((resolve, reject) =>
           entry.stream()
             .pipe(fs.createWriteStream(dest))
@@ -1028,17 +1205,39 @@ app.post("/api/admin/pdf-batch-zip", requireAuth, requireAdmin, uploadZip, async
             .on("error", reject)
         );
 
-        const item = {
-          id: nanoid(), title: meta.title, state: meta.state, year: meta.year,
-          price_cents: PRICE_CENTS, status: "unsold", file_name: filename, created_at: nowISO(),
+        const itemRow = {
+          title: meta.title,
+          state: meta.state,
+          year: meta.year,
+          price_cents: PRICE_CENTS,
+          status: "unsold",
+          file_name: filename,
+          created_at: nowISO(),
         };
-        db.data.pdfs.push(item);
-        results.created.push({ file: originalname, parsed: meta, id: item.id });
+
+        if (supabase) {
+          try {
+            const created = await insertPdfToDb(itemRow);
+            const item = { id: created.id, ...itemRow };
+            db.data.pdfs.push(item);
+            results.created.push({ file: originalname, parsed: meta, id: item.id });
+          } catch (e) {
+            console.error("Failed to insert zip-entry pdf into Supabase:", e);
+            const item = { id: nanoid(), ...itemRow };
+            db.data.pdfs.push(item);
+            results.created.push({ file: originalname, parsed: meta, id: item.id, fallback: true });
+          }
+        } else {
+          const item = { id: nanoid(), ...itemRow };
+          db.data.pdfs.push(item);
+          results.created.push({ file: originalname, parsed: meta, id: item.id });
+        }
       } catch (e) {
         console.error("ZIP entry error:", entry?.path, e);
         results.errors.push({ file: entry?.path || "unknown", error: String(e?.message || e) });
       }
     }
+
     try { if (zipPath && fs.existsSync(zipPath)) await fs.promises.unlink(zipPath); } catch {}
     await saveDb();
     res.json(results);
