@@ -1324,4 +1324,4 @@ app.use("/api", (req, res) => {
 
 app.listen(PORT, "0.0.0.0", () =>
   console.log(`API listening on 0.0.0.0:${PORT}`)
-); do those necessary correction dont destroy any other of my code functions only make it save inventory db to supabase give me full copy paste code
+); 
