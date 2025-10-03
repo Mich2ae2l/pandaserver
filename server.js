@@ -1,3 +1,4 @@
+// server.js - cleaned + batch upload fixes (replace your existing file)
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -34,17 +35,20 @@ app.use(
   })
 );
 
-// CHANGE: CORS allow-list via env CORS_ORIGINS (comma-separated).
-const ALLOWED = (process.env.CORS_ORIGINS || "")
+// CORS allow-list via env CORS_ORIGINS (comma-separated).
+// If you don't set CORS_ORIGINS, keep a friendly default set for local dev + your Netlify site.
+// Replace or add domains in your environment for production.
+const RAW_ALLOWED = process.env.CORS_ORIGINS || "http://localhost:5173,https://sprightly-cannoli-74fc49.netlify.app";
+const ALLOWED = RAW_ALLOWED
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
 const corsOptions = {
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true);                   // curl / mobile apps
-    if (ALLOWED.length === 0) return cb(null, true);      // dev fallback
-    if (ALLOWED.includes(origin)) return cb(null, true);  // allowed web origins
+    if (!origin) return cb(null, true); // curl / mobile apps
+    if (ALLOWED.length === 0) return cb(null, true);
+    if (ALLOWED.includes(origin)) return cb(null, true);
     return cb(new Error(`CORS blocked for origin: ${origin}`));
   },
   credentials: true,
@@ -67,7 +71,7 @@ for (const d of [STORAGE_ROOT, TMP_DIR, PDF_DIR]) {
   try { fs.mkdirSync(d, { recursive: true }); } catch {}
 }
 
-// CHANGE: optionally expose files over HTTPS as /files/* (useful if you link directly)
+// optionally expose files over HTTPS as /files/*
 app.use("/files", express.static(PDF_DIR, {
   maxAge: "1y",
   setHeaders: (res) => {
@@ -117,19 +121,106 @@ const US_STATES = new Set([
   "MS","MO","MT","NE","NV","NH","NJ","NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT","VA",
   "WA","WV","WI","WY"
 ]);
+/* ---------------- filename parsing ---------------- */
+// US_STATES set remains the same (keep your existing US_STATES variable)
+
 function parseFilenameMeta(originalName) {
+  // normalize
   const base = String(originalName).replace(/\.(pdf|png|jpg|jpeg)$/i, "").trim();
-  const rx = /^(.*?)\s*[-_ ]+([A-Za-z]{2})\s*[-_ ]+(200[0-7])(?:\D|$)/i;
-  const m = base.match(rx);
-  if (!m) return null;
-  let [, rawTitle, st, yr] = m;
-  const state = st.toUpperCase();
-  if (!US_STATES.has(state)) return null;
-  const title = rawTitle.replace(/[-_]+/g, " ").trim();
-  const year = Number(yr);
-  if (year < 2000 || year > 2007) return null;
-  return { title, state, year };
+
+  // 1) Try the old Title_State_YYYY pattern (keeps backward compatibility)
+  {
+    const rx = /^(.*?)\s*[-_ ]+([A-Za-z]{2})\s*[-_ ]+(200[0-7])(?:\D|$)/i;
+    const m = base.match(rx);
+    if (m) {
+      let [, rawTitle, st, yr] = m;
+      const state = st.toUpperCase();
+      if (US_STATES.has(state)) {
+        const title = rawTitle.replace(/[-_]+/g, " ").trim();
+        const year = Number(yr);
+        if (year >= 2000 && year <= 2007) return { title, state, year };
+      }
+    }
+  }
+
+  // 2) Accept First_Last_YYYY or First_Last_YYYYMMDD or First_M_Last_YYYYMMDD
+  // Split on underscores
+  const parts = base.split("_").map((p) => p.trim()).filter(Boolean);
+  if (parts.length >= 3) {
+    // last part might be 8-digit DOB or 4-digit year
+    const lastPart = parts[parts.length - 1];
+
+    // CASE A: dob 8 digits (YYYYMMDD or YYYYDDMM) -> parse using similar rules
+    if (/^\d{8}$/.test(lastPart)) {
+      // Build name pieces
+      const nameParts = parts.slice(0, parts.length - 1);
+      if (nameParts.length >= 2) {
+        const first = cap(nameParts[0]);
+        const last = cap(nameParts[nameParts.length - 1]);
+        const middle = nameParts.length === 3 ? cap(nameParts[1]) : undefined;
+
+        const y = lastPart.slice(0, 4);
+        const a = lastPart.slice(4, 6);
+        const b = lastPart.slice(6, 8);
+        let mm = Number(a), dd = Number(b);
+        if (!(mm >= 1 && mm <= 12)) { mm = Number(b); dd = Number(a); }
+        if (mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31) {
+          const mmStr = String(mm).padStart(2, "0");
+          const ddStr = String(dd).padStart(2, "0");
+          const iso = `${y}-${mmStr}-${ddStr}`;
+          // final validation
+          const dt = new Date(iso);
+          if (!Number.isNaN(dt.getTime())) {
+            return {
+              title: `${first}${middle ? " " + middle : ""} ${last}`,
+              state: null,
+              year: Number(y),
+              dobISO: iso,
+              parsed_name: { first, middle, last },
+            };
+          }
+        }
+      }
+    }
+
+    // CASE B: last part is 4-digit year and one of the middle parts is 2-letter state:
+    // Examples: First_Last_CA_2005 or first_last_state_2005
+    if (/^\d{4}$/.test(lastPart)) {
+      const possibleYear = Number(lastPart);
+      if (possibleYear >= 1900 && possibleYear <= 2100) {
+        // find a two-letter US state among the middle parts
+        for (let i = 1; i < parts.length - 1; i++) {
+          const candidate = parts[i].toUpperCase();
+          if (US_STATES.has(candidate)) {
+            const first = cap(parts[0]);
+            const last = cap(parts[parts.length - 1 === i ? parts.length - 2 : parts.length - 1]);
+            // if state is in the middle, we consider name everything before state
+            const nameParts = parts.slice(0, i);
+            const nameFirst = cap(nameParts[0]);
+            const nameLast = cap(nameParts[nameParts.length - 1] || last);
+            const title = `${nameFirst} ${nameLast}`.trim();
+            return { title, state: candidate, year: possibleYear };
+          }
+        }
+        // If no state found, fall back to treating first two parts as first/last and lastPart as year
+        if (parts.length >= 2) {
+          const first = cap(parts[0]);
+          const last = cap(parts[1]);
+          return { title: `${first} ${last}`, state: null, year: possibleYear };
+        }
+      }
+    }
+  }
+
+  // If nothing matched:
+  return null;
 }
+
+function cap(s) {
+  if (!s) return "";
+  return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
+}
+
 
 /* ---------------- Auth guards ---------------- */
 function requireAuth(req, res, next) {
@@ -165,10 +256,11 @@ function sseSend(res, event, data) { res.write(`event: ${event}\n`); res.write(`
 function ssePing(res) { res.write(`: ping\n\n`); }
 function pushMessage({ user_id, from, text }) {
   const msg = { id: nanoid(), user_id, from, text: String(text || "").slice(0, MAX_TEXT), created_at: nowISO() };
-  db.data.chats.push(msg); saveDb();
+  db.data.chats.push(msg);
+  saveDb().catch((e) => console.error("saveDb error:", e));
   const bucket = userStreams.get(user_id);
-  if (bucket) { for (const res of bucket) sseSend(res, "message", msg); }
-  for (const res of adminStreams) sseSend(res, "message", msg);
+  if (bucket) { for (const r of bucket) sseSend(r, "message", msg); }
+  for (const r of adminStreams) sseSend(r, "message", msg);
   return msg;
 }
 
@@ -305,7 +397,7 @@ app.post("/api/now/create-invoice", requireAuth, async (req, res) => {
     if (!amt || amt < 2) return res.status(400).json({ error: "amount_usd must be >= 2" });
     const orderId = "dep_" + nanoid();
 
-    // CHANGE: webhook should hit your API host (PUBLIC_API_URL) in production.
+    // webhook should hit your API host (PUBLIC_API_URL) in production.
     const baseApi = (process.env.PUBLIC_API_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
     const baseSite = (process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
     const ipnUrl = `${baseApi}/api/now/webhook`;
@@ -491,16 +583,32 @@ app.post("/api/download/token/:pdfId", requireAuth, (req, res) => {
   res.json({ token, expires_at, url });
 });
 
-app.get("/api/admin/pdfs/:id/download", requireAuth, requireAdmin, (req, res) => {
-  const pdf = db.data.pdfs.find((p) => p.id === req.params.id);
-  if (!pdf) return res.status(404).json({ error: "Not found" });
-  const file = path.join(PDF_DIR, pdf.file_name);
-  if (!fs.existsSync(file)) return res.status(404).json({ error: "File missing" });
+app.get("/api/admin/pdfs/:id/download", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    // Always load the latest DB state
+    await db.read();
+    db.data.pdfs ||= [];
 
-  res.setHeader("Content-Type", "application/pdf");
-  res.setHeader("Content-Disposition", `inline; filename="${(pdf.title || pdf.id).replace(/[^a-z0-9_\-\.]+/gi, "_")}.pdf"`);
-  fs.createReadStream(file).pipe(res);
+    const pdf = db.data.pdfs.find((p) => p.id === req.params.id);
+    if (!pdf) {
+      return res.status(404).json({ error: "Not found" });
+    }
+
+    const file = path.join(PDF_DIR, pdf.file_name);
+    if (!fs.existsSync(file)) {
+      return res.status(404).json({ error: "File missing" });
+    }
+
+    // set headers and send
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="${pdf.file_name}"`);
+    fs.createReadStream(file).pipe(res);
+  } catch (err) {
+    console.error("Download error:", err);
+    res.status(500).json({ error: "Server error during download" });
+  }
 });
+
 
 app.get("/api/download/:token", (req, res) => {
   const tok = db.data.downloadTokens.find((t) => t.token === req.params.token);
@@ -561,7 +669,9 @@ app.post("/api/download/zip", requireAuth, async (req, res) => {
 });
 
 /* ------------- Admin ------------- */
-const upload = multer({ dest: TMP_DIR });
+const upload = multer({ dest: TMP_DIR, limits: { fileSize: 200 * 1024 * 1024 } }); // 200MB per file limit
+const uploadM = upload; // alias
+const uploadSingleFlexible = uploadM.fields([{ name: "file", maxCount: 1 }, { name: "pdf", maxCount: 1 }]);
 
 app.get("/api/admin/metrics", requireAuth, requireAdmin, (req, res) => {
   const totalSales = db.data.transactions.filter((t) => t.type === "purchase").reduce((s, t) => s + t.amount_cents, 0) / 100;
@@ -737,10 +847,12 @@ app.post("/api/admin/pdfs/:id/delete", requireAuth, requireAdmin, async (req, re
 });
 
 /* ---------- Uploads ---------- */
-const uploadM = multer({ dest: TMP_DIR });
-const uploadSingleFlexible = uploadM.fields([{ name: "file", maxCount: 1 }, { name: "pdf", maxCount: 1 }]);
+const uploadAny = uploadM.any();
+
+// Single PDF upload (admin)
 app.post("/api/admin/pdf", requireAuth, requireAdmin, uploadSingleFlexible, async (req, res) => {
   try {
+    await db.read();
     const up = (req.files?.file && req.files.file[0]) || (req.files?.pdf && req.files.pdf[0]);
     const { title, state, year } = req.body || {};
     if (!up) return res.status(400).json({ error: "file required (PDF)" });
@@ -749,7 +861,13 @@ app.post("/api/admin/pdf", requireAuth, requireAdmin, uploadSingleFlexible, asyn
 
     const filename = nanoid() + path.extname(up.originalname).toLowerCase();
     const dest = path.join(PDF_DIR, filename);
-    fs.renameSync(up.path, dest);
+    try {
+      await fs.promises.rename(up.path, dest);
+    } catch (err) {
+      // fallback: copy then unlink
+      await fs.promises.copyFile(up.path, dest);
+      await fs.promises.unlink(up.path);
+    }
 
     const item = {
       id: nanoid(), title, state: String(state).toUpperCase(), year: Number(year),
@@ -758,75 +876,156 @@ app.post("/api/admin/pdf", requireAuth, requireAdmin, uploadSingleFlexible, asyn
     db.data.pdfs.push(item);
     await saveDb();
     res.json({ ok: true, pdf: { id: item.id, title: item.title } });
-  } catch (e) { console.error(e); res.status(500).json({ error: "Upload failed" }); }
-});
-
-const uploadAny = multer({ dest: TMP_DIR }).any();
-app.post("/api/admin/pdf-batch", requireAuth, requireAdmin, uploadAny, async (req, res) => {
-  const results = { created: [], skipped: [], errors: [] };
-  try {
-    const files = Array.isArray(req.files) ? req.files : [];
-    for (const file of files) {
-      try {
-        if (!/\.(pdf|png|jpg|jpeg)$/i.test(file.originalname)) {
-          results.skipped.push({ file: file.originalname, reason: "Not a supported doc" });
-          fs.unlinkSync(file.path);
-          continue;
-        }
-        const meta = parseFilenameMeta(file.originalname);
-        if (!meta) {
-          results.skipped.push({ file: file.originalname, reason: "Could not parse Title/State/Year" });
-          fs.unlinkSync(file.path);
-          continue;
-        }
-        const filename = nanoid() + path.extname(file.originalname).toLowerCase();
-        const dest = path.join(PDF_DIR, filename);
-        fs.renameSync(file.path, dest);
-
-        const item = {
-          id: nanoid(), title: meta.title, state: meta.state, year: meta.year,
-          price_cents: PRICE_CENTS, status: "unsold", file_name: filename, created_at: nowISO(),
-        };
-        db.data.pdfs.push(item);
-        results.created.push({ file: file.originalname, parsed: meta, id: item.id });
-      } catch (e) {
-        console.error("Batch upload error for", file?.originalname, e);
-        results.errors.push({ file: file?.originalname || "unknown", error: String(e?.message || e) });
-        try { if (file?.path && fs.existsSync(file.path)) fs.unlinkSync(file.path); } catch {}
-      }
-    }
-    await saveDb();
-    return res.json(results);
   } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: "Batch upload failed" });
+    console.error("Single upload failed:", e);
+    try { if (req.files) for (const f of Object.values(req.files).flat()) { if (f?.path && fs.existsSync(f.path)) fs.unlinkSync(f.path); } } catch {}
+    res.status(500).json({ error: "Upload failed" });
   }
 });
 
-const uploadZip = multer({ dest: TMP_DIR }).single("zip");
-app.post("/api/admin/pdf-batch-zip", requireAuth, requireAdmin, uploadZip, async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: "zip file required (field 'zip')" });
+// Batch upload: multiple individual files (multipart form)
+app.post("/api/admin/pdf-batch", requireAuth, requireAdmin, uploadAny, async (req, res) => {
+  const release = await mutex.acquire();
   const results = { created: [], skipped: [], errors: [] };
+
   try {
+    await db.read();
+    db.data.pdfs ||= []; // ✅ Ensure array is always defined
+
+    const files = Array.isArray(req.files) ? req.files : [];
+
+    for (const file of files) {
+      try {
+        // only allow PDF or image
+        if (!/\.(pdf|png|jpg|jpeg)$/i.test(file.originalname)) {
+          results.skipped.push({
+            file: file.originalname,
+            reason: "Not a supported doc",
+          });
+          try {
+            if (file?.path && fs.existsSync(file.path)) {
+              await fs.promises.unlink(file.path);
+            }
+          } catch {}
+          continue;
+        }
+
+        // parse filename metadata
+        const meta = parseFilenameMeta(file.originalname);
+        if (!meta) {
+          results.skipped.push({
+            file: file.originalname,
+            reason: "Could not parse Title/State/Year",
+          });
+          try {
+            if (file?.path && fs.existsSync(file.path)) {
+              await fs.promises.unlink(file.path);
+            }
+          } catch {}
+          continue;
+        }
+
+        // rename or copy file into storage
+        const filename = nanoid() + path.extname(file.originalname).toLowerCase();
+        const dest = path.join(PDF_DIR, filename);
+        try {
+          await fs.promises.rename(file.path, dest);
+        } catch (err) {
+          // fallback if rename across devices fails
+          await fs.promises.copyFile(file.path, dest);
+          await fs.promises.unlink(file.path);
+        }
+
+        // store in DB
+        const item = {
+          id: nanoid(),
+          title: meta.title,
+          state: meta.state,
+          year: meta.year,
+          price_cents: PRICE_CENTS,
+          status: "unsold",
+          file_name: filename,
+          created_at: nowISO(),
+        };
+
+        db.data.pdfs.push(item); // ✅ safe now
+        results.created.push({
+          file: file.originalname,
+          parsed: meta,
+          id: item.id,
+        });
+      } catch (e) {
+        console.error("Batch upload error for", file?.originalname, e);
+        results.errors.push({
+          file: file?.originalname || "unknown",
+          error: String(e?.message || e),
+        });
+        try {
+          if (file?.path && fs.existsSync(file.path)) {
+            await fs.promises.unlink(file.path);
+          }
+        } catch {}
+      }
+    }
+
+    await saveDb();
+    return res.json(results);
+  } catch (e) {
+    console.error("Batch upload failed:", e);
+    return res.status(500).json({ error: "Batch upload failed" });
+  } finally {
+    release();
+  }
+});
+
+// ZIP batch upload: admin uploads a single zip (field name 'zip')
+const uploadZip = uploadM.single("zip");
+
+app.post("/api/admin/pdf-batch-zip", requireAuth, requireAdmin, uploadZip, async (req, res) => {
+  const release = await mutex.acquire();
+  try {
+    if (!req.file) return res.status(400).json({ error: "zip file required (field 'zip')" });
+
+    // ensure DB is loaded and arrays exist (prevents .push on undefined)
+    await db.read();
+    db.data ||= {};
+    db.data.pdfs ||= [];
+
+    const results = { created: [], skipped: [], errors: [] };
     const zipPath = req.file.path;
-    const directory = await unzipper.Open.file(zipPath);
+
+    // Attempt to open the uploaded zip
+    let directory;
+    try {
+      directory = await unzipper.Open.file(zipPath);
+    } catch (err) {
+      console.error("Failed to open uploaded ZIP:", err);
+      // cleanup uploaded zip
+      try { if (zipPath && fs.existsSync(zipPath)) await fs.promises.unlink(zipPath); } catch {}
+      return res.status(400).json({ error: "Invalid ZIP file" });
+    }
+
     for (const entry of directory.files) {
       try {
         if (entry.type !== "File") continue;
+
         const originalname = entry.path;
-        if (!/\.(pdf|png|jpg|jpeg)$/i.test(originalname)) {
+        const basename = path.basename(originalname);
+        const ext = path.extname(basename).toLowerCase();
+
+        // Acceptable extensions
+        if (![".pdf", ".png", ".jpg", ".jpeg"].includes(ext)) {
           results.skipped.push({ file: originalname, reason: "Unsupported file in zip" });
           continue;
         }
-        const meta = parseFilenameMeta(path.basename(originalname));
-        if (!meta) {
-          results.skipped.push({ file: originalname, reason: "Could not parse Title/State/Year" });
-          continue;
-        }
-        const filename = nanoid() + path.extname(originalname).toLowerCase();
-        const dest = path.join(PDF_DIR, filename);
+
+
+        // stream to file and wait
         await new Promise((resolve, reject) =>
-          entry.stream().pipe(fs.createWriteStream(dest)).on("finish", resolve).on("error", reject)
+          entry.stream()
+            .pipe(fs.createWriteStream(dest))
+            .on("finish", resolve)
+            .on("error", reject)
         );
 
         const item = {
@@ -836,16 +1035,19 @@ app.post("/api/admin/pdf-batch-zip", requireAuth, requireAdmin, uploadZip, async
         db.data.pdfs.push(item);
         results.created.push({ file: originalname, parsed: meta, id: item.id });
       } catch (e) {
+        console.error("ZIP entry error:", entry?.path, e);
         results.errors.push({ file: entry?.path || "unknown", error: String(e?.message || e) });
       }
     }
-    fs.unlinkSync(zipPath);
+    try { if (zipPath && fs.existsSync(zipPath)) await fs.promises.unlink(zipPath); } catch {}
     await saveDb();
     res.json(results);
   } catch (e) {
-    console.error(e);
-    try { fs.unlinkSync(req.file.path); } catch {}
+    console.error("ZIP upload failed:", e);
+    try { if (req.file?.path && fs.existsSync(req.file.path)) await fs.promises.unlink(req.file.path); } catch {}
     res.status(500).json({ error: "ZIP upload failed" });
+  } finally {
+    release();
   }
 });
 
@@ -983,30 +1185,23 @@ app.get("/", (req, res) =>
 );
 
 /* ---------- Serve built SPA (web/dist) ---------- */
-/* On Render we deploy API-only. The frontend is on Netlify.
-   Only try to serve the built SPA if the files actually exist. */
-
 const clientDir = process.env.CLIENT_DIR || path.join(__dirname, "../web/dist");
 const clientIndex = path.join(clientDir, "index.html");
 
 if (fs.existsSync(clientIndex)) {
-  // If you DID build the SPA into web/dist, serve it.
   app.use(express.static(clientDir));
   app.get(/^(?!\/api).+/, (req, res) => res.sendFile(clientIndex));
 } else {
-  // If not, be friendly and point people to the frontend host.
   app.get(/^(?!\/api).+/, (req, res) => {
     res.status(200).send("Frontend is hosted separately. Visit the Netlify site.");
   });
 }
-
 
 /* ------------ FINAL: /api catch-all 404 (LAST) ------------ */
 app.use("/api", (req, res) => {
   res.status(404).json({ error: "Not found", path: req.originalUrl });
 });
 
-// CHANGE: bind to 0.0.0.0 so cloud hosts and other devices can reach it
 app.listen(PORT, "0.0.0.0", () =>
   console.log(`API listening on 0.0.0.0:${PORT}`)
 );
