@@ -37,6 +37,94 @@ if (SUPABASE_URL && SUPABASE_KEY) {
 } else {
   console.warn("Supabase not configured: set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_KEY)");
 }
+/* ---------------- Supabase DB helpers (place AFTER the supabase client init above) ---------------- */
+
+const SUPABASE_TABLE = process.env.SUPABASE_TABLE || "pdfs";
+
+/**
+ * Insert a pdf record into Supabase (returns inserted row).
+ * item should contain: { title, state, year, price_cents, status, file_name, created_at }
+ */
+async function insertPdfToDb(item) {
+  if (!supabase) throw new Error("Supabase client not configured");
+  const { data, error } = await supabase
+    .from(SUPABASE_TABLE)
+    .insert([item])
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+/**
+ * Update a pdf record by id with patch object. Returns updated row.
+ */
+async function updatePdfInDb(id, patch) {
+  if (!supabase) throw new Error("Supabase client not configured");
+  const { data, error } = await supabase
+    .from(SUPABASE_TABLE)
+    .update(patch)
+    .eq("id", id)
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+/**
+ * Delete a pdf row from DB by id.
+ */
+async function deletePdfRowFromDb(id) {
+  if (!supabase) throw new Error("Supabase client not configured");
+  const { error } = await supabase
+    .from(SUPABASE_TABLE)
+    .delete()
+    .eq("id", id);
+  if (error) throw error;
+  return true;
+}
+
+/**
+ * Fetch PDF rows (basic filter for 'unsold' + optional state/year range + pagination)
+ * returns { total, items } where items are array of rows
+ */
+async function queryPdfsFromDb({ state, year_min = 2000, year_max = 2007, page = 1, per_page = 100, status = "unsold", q = "" }) {
+  if (!supabase) throw new Error("Supabase client not configured");
+  const pg = Math.max(Number(page) || 1, 1);
+  const pp = Math.min(Math.max(Number(per_page) || 100, 1), 500);
+
+  let query = supabase.from(SUPABASE_TABLE).select("*", { count: "exact" });
+
+  if (status) query = query.eq("status", status);
+  if (state) query = query.eq("state", String(state).toUpperCase());
+  if (year_min != null) query = query.gte("year", Number(year_min));
+  if (year_max != null) query = query.lte("year", Number(year_max));
+  if (q) {
+    // simple title search; for multi-field or OR-matching you'll need more sophisticated queries
+    query = query.ilike("title", `%${q}%`);
+  }
+
+  const from = (pg - 1) * pp;
+  const to = from + pp - 1;
+  const { data, count, error } = await query.range(from, to);
+  if (error) throw error;
+  return { total: count || (data ? data.length : 0), items: data || [] };
+}
+
+/**
+ * Fetch single pdf by id
+ */
+async function fetchPdfByIdFromDb(id) {
+  if (!supabase) throw new Error("Supabase client not configured");
+  const { data, error } = await supabase.from(SUPABASE_TABLE).select("*").eq("id", id).single();
+  if (error) {
+    // normalize not-found to null (Supabase may return error codes depending on config)
+    if (error.code === "PGRST116" || error.code === "PGRST102") return null;
+    throw error;
+  }
+  return data;
+}
+
 
 /* ---------------- Basic hardening & CORS ---------------- */
 app.set("trust proxy", true);
