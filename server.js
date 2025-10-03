@@ -37,6 +37,7 @@ if (SUPABASE_URL && SUPABASE_KEY) {
 } else {
   console.warn("Supabase not configured: set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_KEY)");
 }
+
 /* ---------------- Supabase DB helpers (place AFTER the supabase client init above) ---------------- */
 
 const SUPABASE_TABLE = process.env.SUPABASE_TABLE || "pdfs";
@@ -445,6 +446,8 @@ app.post("/api/auth/reset", async (req, res) => {
 /* ------------- Storefront ------------- */
 app.get("/api/pdfs", (req, res) => {
   const { state, year_min, year_max, page = 1, per_page = 100 } = req.query;
+  // Keep existing LowDB behavior for now (backwards compat)
+  // For full Supabase listing replace this with queryPdfsFromDb (optional)
   let items = db.data.pdfs.filter((p) => p.status === "unsold");
   if (state) items = items.filter((p) => p.state?.toLowerCase() === String(state).toLowerCase());
   const yMin = year_min ? Number(year_min) : 2000;
@@ -599,6 +602,20 @@ app.post("/api/purchase/bulk", requireAuth, async (req, res) => {
       pdf.sold_at = nowISO();
       if (!isAdmin) balance -= PRICE_CENTS;
 
+      // Update Supabase row if configured (keep LowDB in-sync)
+      if (supabase) {
+        try {
+          await updatePdfInDb(pdf.id, {
+            status: "sold",
+            buyer_user_id: user.id,
+            sold_at: pdf.sold_at
+          });
+        } catch (e) {
+          console.error("Failed to update pdf sold state in Supabase:", e);
+          // continue - LowDB still updated
+        }
+      }
+
       db.data.transactions.push({
         id: nanoid(),
         user_id: user.id,
@@ -643,6 +660,19 @@ app.post("/api/purchase/single/:pdfId", requireAuth, async (req, res) => {
     pdf.status = "sold";
     pdf.buyer_user_id = user.id;
     pdf.sold_at = nowISO();
+
+    // Update Supabase row if configured
+    if (supabase) {
+      try {
+        await updatePdfInDb(pdf.id, {
+          status: "sold",
+          buyer_user_id: user.id,
+          sold_at: pdf.sold_at
+        });
+      } catch (e) {
+        console.error("Failed to update pdf sold state in Supabase:", e);
+      }
+    }
 
     db.data.transactions.push({
       id: nanoid(),
@@ -943,6 +973,16 @@ async function removePdfById(id) {
     }
   } catch {}
   db.data.downloadTokens = db.data.downloadTokens.filter((t) => t.pdf_id !== p.id);
+
+  // NEW: remove DB row in Supabase if present
+  if (supabase) {
+    try {
+      await deletePdfRowFromDb(p.id);
+    } catch (e) {
+      console.error("Warning: failed to delete pdf row from Supabase:", e?.message || e);
+    }
+  }
+
   db.data.pdfs.splice(idx, 1);
   await db.write();
   return { ok: true, id };
@@ -1020,18 +1060,55 @@ app.post("/api/admin/pdf", requireAuth, requireAdmin, uploadSingleFlexible, asyn
       }
     }
 
-    const item = {
-      id: nanoid(), title, state: String(state).toUpperCase(), year: Number(year),
-      price_cents: PRICE_CENTS, status: "unsold", file_name: filename, created_at: nowISO(),
-    };
-    db.data.pdfs.push(item);
-    await saveDb();
-    res.json({ ok: true, pdf: { id: item.id, title: item.title } });
-  } catch (e) {
-    console.error("Single upload failed:", e);
-    try { if (req.files) for (const f of Object.values(req.files).flat()) { if (f?.path && fs.existsSync(f.path)) fs.unlinkSync(f.path); } } catch {}
-    res.status(500).json({ error: "Upload failed" });
-  }
+   // create the record in Supabase and also keep LowDB in-sync
+   let created;
+   if (supabase) {
+     const row = {
+       title,
+       state: String(state).toUpperCase(),
+       year: Number(year),
+       price_cents: PRICE_CENTS,
+       status: "unsold",
+       file_name: filename,
+       created_at: new Date().toISOString()
+     };
+     try {
+       created = await insertPdfToDb(row); // returns inserted row with id
+       // Keep LowDB in sync so existing routes continue working
+       const item = {
+         id: created.id,
+         title: created.title,
+         state: created.state,
+         year: created.year,
+         price_cents: created.price_cents ?? PRICE_CENTS,
+         status: created.status ?? "unsold",
+         file_name: created.file_name,
+         created_at: created.created_at ?? nowISO(),
+       };
+       db.data.pdfs.push(item);
+       await saveDb();
+     } catch (e) {
+       console.error("Failed to insert pdf row into Supabase:", e);
+       // Optionally rollback storage file removal if you want -- currently file is uploaded.
+       // Fallback: save locally to LowDB so admin still sees it
+       const item = {
+         id: nanoid(), title, state: String(state).toUpperCase(), year: Number(year),
+         price_cents: PRICE_CENTS, status: "unsold", file_name: filename, created_at: nowISO(),
+       };
+       db.data.pdfs.push(item);
+       await saveDb();
+       return res.status(500).json({ error: "Uploaded file but failed to save metadata to DB" });
+     }
+     res.json({ ok: true, pdf: { id: created.id, title: created.title } });
+   } else {
+     const item = {
+       id: nanoid(), title, state: String(state).toUpperCase(), year: Number(year),
+       price_cents: PRICE_CENTS, status: "unsold", file_name: filename, created_at: nowISO(),
+     };
+     db.data.pdfs.push(item);
+     await saveDb();
+     res.json({ ok: true, pdf: { id: item.id, title: item.title } });
+   }
 });
 
 // Batch upload: multiple individual files (multipart form)
@@ -1081,19 +1158,63 @@ app.post("/api/admin/pdf-batch", requireAuth, requireAdmin, uploadAny, async (re
           }
         }
 
-        const item = {
-          id: nanoid(),
-          title: meta.title,
-          state: meta.state,
-          year: meta.year,
-          price_cents: PRICE_CENTS,
-          status: "unsold",
-          file_name: filename,
-          created_at: nowISO(),
-        };
-
-        db.data.pdfs.push(item); // ✅ safe now
-        results.created.push({ file: file.originalname, parsed: meta, id: item.id });
+        // REPLACED: insert into Supabase and ALSO push into LowDB to keep existing logic working
+        if (supabase) {
+          const row = {
+            title: meta.title,
+            state: meta.state,
+            year: meta.year,
+            price_cents: PRICE_CENTS,
+            status: "unsold",
+            file_name: filename,
+            created_at: new Date().toISOString(),
+          };
+          try {
+            const created = await insertPdfToDb(row);
+            // push to LowDB with same id so other code still works
+            const item = {
+              id: created.id,
+              title: created.title,
+              state: created.state,
+              year: created.year,
+              price_cents: created.price_cents ?? PRICE_CENTS,
+              status: created.status ?? "unsold",
+              file_name: created.file_name,
+              created_at: created.created_at ?? nowISO(),
+            };
+            db.data.pdfs.push(item);
+            results.created.push({ file: file.originalname, parsed: meta, id: created.id });
+          } catch (e) {
+            console.error("Failed to insert batch pdf into Supabase:", file.originalname, e);
+            // Fallback: keep record in LowDB so admin UI still sees it
+            const item = {
+              id: nanoid(),
+              title: meta.title,
+              state: meta.state,
+              year: meta.year,
+              price_cents: PRICE_CENTS,
+              status: "unsold",
+              file_name: filename,
+              created_at: nowISO(),
+            };
+            db.data.pdfs.push(item);
+            results.created.push({ file: file.originalname, parsed: meta, id: item.id, fallback: true });
+          }
+        } else {
+          // Supabase not configured — original behavior
+          const item = {
+            id: nanoid(),
+            title: meta.title,
+            state: meta.state,
+            year: meta.year,
+            price_cents: PRICE_CENTS,
+            status: "unsold",
+            file_name: filename,
+            created_at: nowISO(),
+          };
+          db.data.pdfs.push(item);
+          results.created.push({ file: file.originalname, parsed: meta, id: item.id });
+        }
       } catch (e) {
         console.error("Batch upload error for", file?.originalname, e);
         results.errors.push({ file: file?.originalname || "unknown", error: String(e?.message || e) });
@@ -1181,12 +1302,48 @@ app.post("/api/admin/pdf-batch-zip", requireAuth, requireAdmin, uploadZip, async
           try { await fs.promises.rename(tempPath, dest); } catch (err) { await fs.promises.copyFile(tempPath, dest); await fs.promises.unlink(tempPath); }
         }
 
-        const item = {
-          id: nanoid(), title: meta.title, state: meta.state, year: meta.year,
-          price_cents: PRICE_CENTS, status: "unsold", file_name: filename, created_at: nowISO(),
-        };
-        db.data.pdfs.push(item);
-        results.created.push({ file: originalname, parsed: meta, id: item.id });
+        // REPLACED: insert into Supabase and ALSO push into LowDB to keep existing logic working
+        if (supabase) {
+          const row = {
+            title: meta.title,
+            state: meta.state,
+            year: meta.year,
+            price_cents: PRICE_CENTS,
+            status: "unsold",
+            file_name: filename,
+            created_at: new Date().toISOString(),
+          };
+          try {
+            const created = await insertPdfToDb(row);
+            const item = {
+              id: created.id,
+              title: created.title,
+              state: created.state,
+              year: created.year,
+              price_cents: created.price_cents ?? PRICE_CENTS,
+              status: created.status ?? "unsold",
+              file_name: created.file_name,
+              created_at: created.created_at ?? nowISO(),
+            };
+            db.data.pdfs.push(item);
+            results.created.push({ file: originalname, parsed: meta, id: created.id });
+          } catch (e) {
+            console.error("Supabase insert failed for zip entry:", originalname, e);
+            const item = {
+              id: nanoid(), title: meta.title, state: meta.state, year: meta.year,
+              price_cents: PRICE_CENTS, status: "unsold", file_name: filename, created_at: nowISO(),
+            };
+            db.data.pdfs.push(item);
+            results.created.push({ file: originalname, parsed: meta, id: item.id, fallback: true });
+          }
+        } else {
+          const item = {
+            id: nanoid(), title: meta.title, state: meta.state, year: meta.year,
+            price_cents: PRICE_CENTS, status: "unsold", file_name: filename, created_at: nowISO(),
+          };
+          db.data.pdfs.push(item);
+          results.created.push({ file: originalname, parsed: meta, id: item.id });
+        }
       } catch (e) {
         console.error("ZIP entry error:", entry?.path, e);
         results.errors.push({ file: entry?.path || "unknown", error: String(e?.message || e) });
