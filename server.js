@@ -1,4 +1,4 @@
-// server.js - Supabase-enabled version (replace your existing file)
+// server.js - Supabase-enabled Panda API (patched)
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -94,14 +94,12 @@ if (!Array.isArray(db.data.chats)) db.data.chats = [];
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 const SUPABASE_TABLE = process.env.SUPABASE_TABLE || "pdfs";
+const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "pdf";
 let supabase = null;
 if (SUPABASE_URL && SUPABASE_KEY) {
   supabase = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } });
 }
 
-/**
- * Supabase helpers (minimal wrappers)
- */
 async function insertPdfToDb(item) {
   if (!supabase) throw new Error("Supabase client not configured");
   const { data, error } = await supabase.from(SUPABASE_TABLE).insert([item]).select().single();
@@ -163,7 +161,7 @@ const PRICE_CENTS = 499;
 const mutex = new Mutex();
 const nowISO = () => new Date().toISOString();
 const cents = (n) => Math.round(Number(n || 0));
-const findUserByEmail = (email) => db.data.users.find((u) => u.email.toLowerCase() === String(email).toLowerCase());
+const findUserByEmail = (email) => db.data.users.find((u) => u.email && u.email.toLowerCase() === String(email).toLowerCase());
 const saveDb = () => db.write();
 
 function publicBase(req) {
@@ -189,7 +187,7 @@ const US_STATES = new Set([
 function parseFilenameMeta(originalName) {
   const base = String(originalName).replace(/\.(pdf|png|jpg|jpeg)$/i, "").trim();
 
-  // 1) Title_State_YYYY
+  // Pattern: Title_State_YYYY or Title-State-YYYY
   {
     const rx = /^(.*?)\s*[-_ ]+([A-Za-z]{2})\s*[-_ ]+(200[0-7])(?:\D|$)/i;
     const m = base.match(rx);
@@ -204,35 +202,24 @@ function parseFilenameMeta(originalName) {
     }
   }
 
+  // Fallbacks for different naming conventions (underscores + date suffix etc.)
   const parts = base.split("_").map((p) => p.trim()).filter(Boolean);
   if (parts.length >= 3) {
     const lastPart = parts[parts.length - 1];
 
     if (/^\d{8}$/.test(lastPart)) {
+      // e.g., JOHN_DOE_20010101
       const nameParts = parts.slice(0, parts.length - 1);
       if (nameParts.length >= 2) {
         const first = cap(nameParts[0]);
         const last = cap(nameParts[nameParts.length - 1]);
-        const middle = nameParts.length === 3 ? cap(nameParts[1]) : undefined;
         const y = lastPart.slice(0, 4);
-        const a = lastPart.slice(4, 6);
-        const b = lastPart.slice(6, 8);
-        let mm = Number(a), dd = Number(b);
-        if (!(mm >= 1 && mm <= 12)) { mm = Number(b); dd = Number(a); }
-        if (mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31) {
-          const mmStr = String(mm).padStart(2, "0");
-          const ddStr = String(dd).padStart(2, "0");
-          const iso = `${y}-${mmStr}-${ddStr}`;
-          const dt = new Date(iso);
-          if (!Number.isNaN(dt.getTime())) {
-            return {
-              title: `${first}${middle ? " " + middle : ""} ${last}`,
-              state: null,
-              year: Number(y),
-              dobISO: iso,
-              parsed_name: { first, middle, last },
-            };
-          }
+        const mm = lastPart.slice(4, 6);
+        const dd = lastPart.slice(6, 8);
+        const iso = `${y}-${mm}-${dd}`;
+        const dt = new Date(iso);
+        if (!Number.isNaN(dt.getTime())) {
+          return { title: `${first} ${last}`, state: null, year: Number(y), dobISO: iso };
         }
       }
     }
@@ -258,6 +245,7 @@ function parseFilenameMeta(originalName) {
       }
     }
   }
+
   return null;
 }
 
@@ -702,7 +690,6 @@ app.post("/api/purchase/single/:pdfId", requireAuth, async (req, res) => {
     release();
   }
 });
-
 /* ------------- Downloads ------------- */
 app.post("/api/download/token/:pdfId", requireAuth, async (req, res) => {
   await db.read();
@@ -960,6 +947,8 @@ async function removePdfById(id) {
   if (supabase) {
     try {
       await deletePdfRowFromDb(p.id);
+      // optionally remove storage object in bucket if you used upload-to-supabase (not implemented automatically here)
+      // await supabase.storage.from(SUPABASE_BUCKET).remove([p.file_name]);
     } catch (e) {
       console.error("Warning: failed to delete pdf row from Supabase:", e?.message || e);
     }
@@ -1043,6 +1032,16 @@ app.post("/api/admin/pdf", requireAuth, requireAdmin, uploadSingleFlexible, asyn
 
     if (supabase) {
       try {
+        // upload file to Supabase storage bucket as well (attempt)
+        try {
+          const fileStream = fs.createReadStream(dest);
+          // Supabase client expects a File/Buffer; Node SDK supports passing a stream under the hood
+          await supabase.storage.from(SUPABASE_BUCKET).upload(filename, fileStream, { upsert: false });
+        } catch (uploadErr) {
+          // don't block metadata insert if storage upload fails; log and continue
+          console.error("Warning: failed to upload to Supabase storage:", uploadErr);
+        }
+
         const created = await insertPdfToDb(itemRow);
         // push a local cache entry using the Supabase id
         const item = { id: created.id, ...itemRow };
@@ -1051,8 +1050,6 @@ app.post("/api/admin/pdf", requireAuth, requireAdmin, uploadSingleFlexible, asyn
         return res.json({ ok: true, pdf: { id: item.id, title: item.title } });
       } catch (e) {
         console.error("Failed to insert pdf row into Supabase:", e);
-        // cleanup uploaded file to avoid orphan files if you don't want them:
-        // try { if (fs.existsSync(dest)) await fs.promises.unlink(dest); } catch (unlinkErr) { console.error("Failed to unlink file after DB insert failure:", unlinkErr); }
         // Fallback to LowDB so admin still sees it (keeps behavior safe)
         const item = { id: nanoid(), ...itemRow };
         db.data.pdfs.push(item);
@@ -1119,6 +1116,14 @@ app.post("/api/admin/pdf-batch", requireAuth, requireAdmin, uploadAny, async (re
 
         if (supabase) {
           try {
+            // upload file to Supabase storage
+            try {
+              const fileStream = fs.createReadStream(dest);
+              await supabase.storage.from(SUPABASE_BUCKET).upload(filename, fileStream, { upsert: false });
+            } catch (uploadErr) {
+              console.error("Warning: failed to upload to Supabase storage for", file.originalname, uploadErr);
+            }
+
             const created = await insertPdfToDb(itemRow);
             const item = { id: created.id, ...itemRow };
             db.data.pdfs.push(item);
@@ -1217,6 +1222,13 @@ app.post("/api/admin/pdf-batch-zip", requireAuth, requireAdmin, uploadZip, async
 
         if (supabase) {
           try {
+            try {
+              const fileStream = fs.createReadStream(dest);
+              await supabase.storage.from(SUPABASE_BUCKET).upload(filename, fileStream, { upsert: false });
+            } catch (uploadErr) {
+              console.error("Warning: failed to upload zip-entry to Supabase storage:", uploadErr);
+            }
+
             const created = await insertPdfToDb(itemRow);
             const item = { id: created.id, ...itemRow };
             db.data.pdfs.push(item);
