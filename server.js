@@ -215,7 +215,17 @@ async function uploadFileBufferToSupabase(localPath, destFilename) {
   return destPath;
 }
 
-async function queryPdfsFromDb({ state, year_min = null, year_max = null, page = 1, per_page = 100, status = "unsold", q = "" } = {}) {
+/* ADDED: only_available flag to ensure buyer_user_id IS NULL when needed */
+async function queryPdfsFromDb({
+  state,
+  year_min = null,
+  year_max = null,
+  page = 1,
+  per_page = 100,
+  status = "unsold",
+  q = "",
+  only_available = false, // NEW
+} = {}) {
   const pg = Math.max(Number(page) || 1, 1);
   const pp = Math.min(Math.max(Number(per_page) || 100, 1), 500);
 
@@ -224,6 +234,9 @@ async function queryPdfsFromDb({ state, year_min = null, year_max = null, page =
   if (status) {
     const s = String(status).toLowerCase();
     query = query.in("status", [s, s.toUpperCase(), s.charAt(0).toUpperCase() + s.slice(1)]);
+  }
+  if (only_available) {
+    query = query.is("buyer_user_id", null); // critical guard
   }
   if (state) query = query.eq("state", String(state).toUpperCase());
   if (year_min != null) query = query.gte("year", Number(year_min));
@@ -315,7 +328,6 @@ async function inboxList({ q = "", status = "all", page = 1, per_page = 50 }) {
   if (status === "unread") query = query.eq("read", false).eq("archived", false);
   else if (status === "archived") query = query.eq("archived", true);
   if (q) {
-    // naive filter: run client-side after fetch (or build or() ilike on fields)
     const { data, error } = await query.order("created_at", { ascending: false }).limit(2000);
     if (error) throw error;
     const term = q.toLowerCase();
@@ -458,7 +470,6 @@ app.post("/api/auth/forgot", async (req, res) => {
     const expires_at = Date.now() + 60 * 60 * 1000;
 
     if (user) {
-      // one active per user
       await supabase.from(T_RESET).delete().eq("user_id", user.id);
       await createResetToken({ token, user_id: user.id, expires_at });
 
@@ -518,6 +529,7 @@ app.get("/api/pdfs", async (req, res) => {
       per_page: Number(per_page),
       status: "unsold",
       q,
+      only_available: true, // ensure buyer_user_id IS NULL
     });
     const items = (result.items || []).map((p) => ({
       id: p.id, title: p.title, state: p.state || "", year: p.year,
@@ -535,7 +547,8 @@ app.get("/api/inventory/count", async (_req, res) => {
     const { count, error } = await supabase
       .from(T_PDFS)
       .select("id", { count: "exact" })
-      .in("status", ["unsold", "UNSOLD", "Unsold"]);
+      .in("status", ["unsold", "UNSOLD", "Unsold"])
+      .is("buyer_user_id", null); // only truly available
     if (error) throw error;
     res.json({ remaining: count ?? 0 });
   } catch (e) {
@@ -645,7 +658,6 @@ app.post("/api/now/webhook", express.json({ type: "*/*" }), async (req, res) => 
     const ok = ["confirmed", "finished"].includes(status);
 
     if (ok && orderId) {
-      // load tx by provider_order_id
       const { data: txs } = await supabase.from(T_TX).select("*").eq("provider_order_id", orderId).eq("type", "deposit").limit(1);
       const tx = txs && txs[0];
       if (tx && tx.status !== "completed") {
@@ -678,8 +690,11 @@ app.post("/api/purchase/single/:pdfId", requireAuth, async (req, res) => {
 
     let pdf = await getPdfById(pdfId);
     if (!pdf) return res.status(404).json({ error: "PDF not found" });
-    if ((pdf.status ?? "unsold").toString().toLowerCase() !== "unsold")
+
+    // ADDED: ensure not already owned
+    if ((pdf.status ?? "unsold").toString().toLowerCase() !== "unsold" || pdf.buyer_user_id) {
       return res.status(409).json({ error: "PDF not available" });
+    }
 
     const user = await getUserById(req.user.id);
     if (!user) return res.status(401).json({ error: "User not found" });
@@ -696,7 +711,7 @@ app.post("/api/purchase/single/:pdfId", requireAuth, async (req, res) => {
 
     const sold_at = nowISO();
 
-    // 1) Mark PDF sold ONLY if it is still unsold
+    // 1) Mark PDF sold ONLY if it is still unsold and unowned
     const { data: soldRow, error: updErr } = await supabase
       .from(T_PDFS)
       .update({ status: "sold", buyer_user_id: user.id, sold_at })
@@ -773,7 +788,9 @@ app.post("/api/purchase/bulk", requireAuth, async (req, res) => {
 
     for (const { id, pdf } of pairs) {
       if (!pdf) { skipped_ids.push({ id, reason: "Not found" }); continue; }
-      if ((pdf.status ?? "unsold").toString().toLowerCase() !== "unsold") {
+
+      // ADDED: ensure both unsold and unowned
+      if ((pdf.status ?? "unsold").toString().toLowerCase() !== "unsold" || pdf.buyer_user_id) {
         skipped_ids.push({ id, reason: "Not available" }); continue;
       }
 
@@ -847,13 +864,11 @@ app.get("/api/admin/pdfs/:id/download", requireAuth, requireAdmin, async (req, r
       (pdf.file_name ? (SUPABASE_PREFIX ? `${SUPABASE_PREFIX}/${pdf.file_name}` : pdf.file_name) : "")
     ).replace(/^\/+/, "");
 
-    // Prefer signed URL from Supabase
     if (storagePath) {
       const { data, error } = await supabase.storage.from(SUPABASE_BUCKET).createSignedUrl(storagePath, 60);
       if (!error && data?.signedUrl) return res.redirect(302, data.signedUrl);
     }
 
-    // Fallback to local (if present)
     const file = path.join(PDF_DIR, pdf.file_name || "");
     if (!pdf.file_name || !fs.existsSync(file)) return res.status(404).json({ error: "File missing" });
     res.setHeader("Content-Type", "application/pdf");
@@ -883,7 +898,6 @@ app.get("/api/download/:token", async (req, res) => {
       if (!error && data?.signedUrl) return res.redirect(302, data.signedUrl);
     }
 
-    // Final fallback to local
     const file = path.join(PDF_DIR, pdf.file_name || "");
     if (!pdf.file_name || !fs.existsSync(file)) return res.status(404).json({ error: "File missing" });
 
@@ -906,7 +920,6 @@ app.post("/api/download/zip", requireAuth, async (req, res) => {
 
     const isAdmin = !!req.user.is_admin;
 
-    // fetch all
     const { data, error } = await supabase.from(T_PDFS).select("*").in("id", ids);
     if (error) throw error;
     const rows = (data || []).filter((p) => isAdmin || p.buyer_user_id === req.user.id);
@@ -943,7 +956,6 @@ app.post("/api/download/zip", requireAuth, async (req, res) => {
           console.error("ZIP supabase fetch append failed:", e?.message || e);
         }
       }
-      // Fallback to local file (optional)
       const fp = path.join(PDF_DIR, p.file_name || "");
       if (p.file_name && fs.existsSync(fp)) {
         archive.file(fp, { name: nice });
@@ -966,9 +978,12 @@ const uploadSingleFlexible = uploadM.fields([{ name: "file", maxCount: 1 }, { na
 
 app.get("/api/admin/metrics", requireAuth, requireAdmin, async (_req, res) => {
   try {
-    // remaining (live)
-    const { count: remaining } = await supabase.from(T_PDFS).select("id", { count: "exact" }).in("status", ["unsold", "UNSOLD", "Unsold"]);
-    // sales sum, sold count, deposits count, users count
+    const { count: remaining } = await supabase
+      .from(T_PDFS)
+      .select("id", { count: "exact" })
+      .in("status", ["unsold", "UNSOLD", "Unsold"])
+      .is("buyer_user_id", null); // ensure truly available
+
     const [{ data: txPurchase }, { data: txDeposits }, { data: users }, { data: soldPdfs }] = await Promise.all([
       supabase.from(T_TX).select("amount_cents").eq("type", "purchase"),
       supabase.from(T_TX).select("id").eq("type", "deposit").eq("status", "completed"),
@@ -1020,7 +1035,11 @@ app.get("/api/admin/metrics/rich", requireAuth, requireAdmin, async (req, res) =
     const totals = {
       total_sales_usd: (txPurchase || []).reduce((s, t) => s + (t.amount_cents || 0), 0) / 100,
       sold: (soldPdfs || []).length,
-      remaining: (await supabase.from(T_PDFS).select("id", { count: "exact" }).in("status", ["unsold", "UNSOLD", "Unsold"])).count ?? 0,
+      remaining: (await supabase
+        .from(T_PDFS)
+        .select("id", { count: "exact" })
+        .in("status", ["unsold", "UNSOLD", "Unsold"])
+        .is("buyer_user_id", null)).count ?? 0, // ensure availability
       users: (users || []).length,
       deposits: (txDepositCount || []).length,
     };
@@ -1081,7 +1100,6 @@ app.patch("/api/admin/users/:id", requireAuth, requireAdmin, async (req, res) =>
 app.delete("/api/admin/users/:id", requireAuth, requireAdmin, async (req, res) => {
   try {
     const id = String(req.params.id);
-    // Orphan handling (null out references)
     await supabase.from(T_PDFS).update({ buyer_user_id: null }).eq("buyer_user_id", id);
     await supabase.from(T_RESET).delete().eq("user_id", id);
     await supabase.from(T_DLTOK).delete().eq("user_id", id);
@@ -1135,7 +1153,6 @@ async function removePdfById(id) {
   if (error || !data) return { ok: false, id, reason: "Not found" };
 
   const p = data;
-  // Try storage removal (best effort)
   const storagePath = p.storage_path || (p.file_name ? (SUPABASE_PREFIX ? `${SUPABASE_PREFIX}/${p.file_name}` : p.file_name) : "");
   if (storagePath) {
     try {
@@ -1145,14 +1162,12 @@ async function removePdfById(id) {
       console.error("Warning: storage remove failed:", e?.message || e);
     }
   }
-  // Delete row
   try {
     const { error: delErr } = await supabase.from(T_PDFS).delete().eq("id", id);
     if (delErr) throw delErr;
   } catch (e) {
     return { ok: false, id, reason: "Delete failed" };
   }
-  // Optional: clean local file if exists
   try {
     if (p.file_name) {
       const fp = path.join(PDF_DIR, p.file_name);
