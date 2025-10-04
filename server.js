@@ -174,7 +174,7 @@ function normalizePdfRow(row = {}) {
     state: row.state == null ? "" : String(row.state).toUpperCase(),
     year: row.year == null ? null : Number(row.year),
     price_cents: Number(row.price_cents || row.price || 0) || PRICE_CENTS,
-    status: String(row.status || "unsold"),
+    status: String(row.status ?? "unsold").toLowerCase(),
     file_name: row.file_name || row.filename || "",
     storage_path:
       row.storage_path ||
@@ -263,7 +263,11 @@ async function queryPdfsFromDb({
 
   let query = supabase.from(SUPABASE_TABLE).select("*", { count: "exact" });
 
-  if (status) query = query.eq("status", status);
+  if (status) {
+  const s = String(status).toLowerCase();
+  // accept lowercase + common variants to tolerate legacy data
+  query = query.in("status", [s, s.toUpperCase(), s.charAt(0).toUpperCase() + s.slice(1)]);
+}
   if (state) query = query.eq("state", String(state).toUpperCase());
   if (year_min != null) query = query.gte("year", Number(year_min));
   if (year_max != null) query = query.lte("year", Number(year_max));
@@ -879,9 +883,9 @@ app.post("/api/purchase/single/:pdfId", requireAuth, async (req, res) => {
     }
 
     if (!pdf) return res.status(404).json({ error: "PDF not found" });
-    if (String(pdf.status || "unsold") !== "unsold")
-      return res.status(409).json({ error: "PDF not available" });
-
+   if ((pdf.status ?? "unsold").toString().toLowerCase() !== "unsold") {
+  return res.status(409).json({ error: "PDF not available" });
+}
     const user = db.data.users.find((u) => String(u.id) === String(req.user.id));
     if (!user) return res.status(401).json({ error: "User not found" });
 
@@ -992,11 +996,10 @@ app.post("/api/purchase/bulk", requireAuth, async (req, res) => {
         skipped_ids.push({ id, reason: "Not found" });
         continue;
       }
-      if (String(pdf.status || "unsold") !== "unsold") {
-        skipped_ids.push({ id, reason: "Not available" });
-        continue;
-      }
-
+     if ((pdf.status ?? "unsold").toString().toLowerCase() !== "unsold") {
+  skipped_ids.push({ id, reason: "Not available" });
+  continue;
+}
       if (!isAdmin && boughtSoFar >= affordable_count) {
         skipped_ids.push({ id, reason: "Insufficient funds" });
         continue;
