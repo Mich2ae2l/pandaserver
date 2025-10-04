@@ -1,4 +1,4 @@
-// server.js - Panda API (all data in Supabase)
+withou harming my code // server.js - Panda API (all data in Supabase)
 // Notes:
 // - Supply env vars in .env (no secrets inline!)
 // - Requires the following tables (default names, override with envs):
@@ -111,20 +111,6 @@ const getJwtFromReq = (req) => {
 const isUuid = (s) =>
   typeof s === "string" &&
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s);
-
-// NEW: expiry helpers (fix timestamp type issues cleanly, but keep back-compat)
-const toIso = (ms) => new Date(ms).toISOString();
-const parseExpiryMs = (val) => {
-  if (val == null) return 0;
-  if (typeof val === "number") return val > 1e12 ? val : val * 1000;
-  if (typeof val === "string") {
-    const n = Number(val);
-    if (!Number.isNaN(n)) return n > 1e12 ? n : n * 1000;
-    const t = Date.parse(val);
-    return Number.isNaN(t) ? 0 : t;
-  }
-  return 0;
-};
 
 /* ---------------- Supabase init & table/bucket names ---------------- */
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
@@ -318,8 +304,7 @@ async function consumeValidResetToken(token) {
   const now = Date.now();
   const { data, error } = await supabase.from(T_RESET).select("*").eq("token", token).single();
   if (error || !data) return null;
-  const expMs = parseExpiryMs(data.expires_at);
-  if (!expMs || now > expMs) return null;
+  if (now > Number(data.expires_at)) return null;
   await supabase.from(T_RESET).delete().eq("token", token);
   return data;
 }
@@ -330,8 +315,7 @@ async function createDownloadToken({ token, user_id, pdf_id, expires_at }) {
 async function takeDownloadToken(token) {
   const { data, error } = await supabase.from(T_DLTOK).select("*").eq("token", token).single();
   if (error || !data) return null;
-  const expMs = parseExpiryMs(data.expires_at);
-  if (!expMs || Date.now() > expMs) {
+  if (Date.now() > Number(data.expires_at)) {
     await supabase.from(T_DLTOK).delete().eq("token", token);
     return null;
   }
@@ -488,10 +472,7 @@ app.post("/api/auth/forgot", async (req, res) => {
     if (!email) return res.status(400).json({ error: "email required" });
     const user = await findUserByEmail(String(email).toLowerCase());
     const token = nanoid();
-
-    // Store ISO timestamp in DB (timestamptz-safe), return ms for any frontend code
-    const expiresAtMs = Date.now() + 60 * 60 * 1000; // 1 hour
-    const expires_at = toIso(expiresAtMs);
+    const expires_at = Date.now() + 60 * 60 * 1000;
 
     if (user) {
       await supabase.from(T_RESET).delete().eq("user_id", user.id);
@@ -514,7 +495,7 @@ app.post("/api/auth/forgot", async (req, res) => {
         }
       }
     }
-    res.json({ ok: true, token, expires_at, expires_at_ms: expiresAtMs });
+    res.json({ ok: true, token, expires_at });
   } catch (e) {
     console.error("/api/auth/forgot error:", e?.message || e);
     res.status(500).json({ error: "Failed to process forgot request" });
@@ -826,7 +807,9 @@ app.post("/api/purchase/bulk", requireAuth, async (req, res) => {
 
       // ensure both unsold and unowned
       if ((pdf.status ?? "unsold").toString().toLowerCase() !== "unsold" || pdf.buyer_user_id) {
-        skipped_ids.push({ id, reason: "Not available" }); continue; }
+        skipped_ids.push({ id, reason: "Not available" }); continue;
+      }
+
       const price = Number(pdf.price_cents || PRICE_CENTS);
       if (!isAdmin && balance < price) { skipped_ids.push({ id, reason: "Insufficient funds" }); continue; }
 
@@ -876,12 +859,11 @@ app.post("/api/download/token/:pdfId", requireAuth, async (req, res) => {
     if (!req.user.is_admin && pdf.buyer_user_id !== req.user.id) return res.status(403).json({ error: "Purchase required" });
 
     const token = nanoid();
-    const expiresAtMs = Date.now() + 5 * 60 * 1000; // 5 minutes
-    const expires_at = toIso(expiresAtMs);
+    const expires_at = Date.now() + 5 * 60 * 1000;
     await createDownloadToken({ token, user_id: req.user.id, pdf_id: pdf.id, expires_at });
 
     const url = `${publicBase(req)}/api/download/${token}`;
-    res.json({ token, expires_at, expires_at_ms: expiresAtMs, url });
+    res.json({ token, expires_at, url });
   } catch (e) {
     console.error("/api/download/token error:", e?.message || e);
     res.status(500).json({ error: "Failed to create token" });
