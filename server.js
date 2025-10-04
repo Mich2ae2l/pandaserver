@@ -95,6 +95,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 const SUPABASE_TABLE = process.env.SUPABASE_TABLE || "pdfs";
 const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "pdf";
+const SUPABASE_PREFIX = process.env.SUPABASE_STORAGE_PREFIX || "files"; // can be empty string if you store at root
 let supabase = null;
 if (SUPABASE_URL && SUPABASE_KEY) {
   supabase = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } });
@@ -130,6 +131,25 @@ async function fetchPdfByIdFromDb(id) {
     throw error;
   }
   return data;
+}
+
+// Upload helper: read buffer (avoids fetch duplex errors) and upload to Supabase storage
+async function uploadFileBufferToSupabase(localPath, destFilename) {
+  if (!supabase) throw new Error("Supabase client not configured");
+  const bucket = SUPABASE_BUCKET || "pdf";
+  const prefix = SUPABASE_PREFIX || "files";
+  const destPath = prefix ? `${prefix}/${destFilename}` : `${destFilename}`;
+
+  const buf = await fs.promises.readFile(localPath);
+  const ext = path.extname(destFilename || '').toLowerCase();
+  let contentType = "application/octet-stream";
+  if (ext === ".pdf") contentType = "application/pdf";
+  else if (ext === ".png") contentType = "image/png";
+  else if (ext === ".jpg" || ext === ".jpeg") contentType = "image/jpeg";
+
+  const { data, error } = await supabase.storage.from(bucket).upload(destPath, buf, { upsert: false, contentType });
+  if (error) throw error;
+  return { path: destPath, data };
 }
 
 /**
@@ -710,6 +730,7 @@ app.post("/api/download/token/:pdfId", requireAuth, async (req, res) => {
   res.json({ token, expires_at, url });
 });
 
+// Admin download -> prefer signed URL from Supabase; fallback to local file stream
 app.get("/api/admin/pdfs/:id/download", requireAuth, requireAdmin, async (req, res) => {
   try {
     await db.read();
@@ -721,6 +742,20 @@ app.get("/api/admin/pdfs/:id/download", requireAuth, requireAdmin, async (req, r
     if (!pdf) pdf = db.data.pdfs.find((p) => p.id === req.params.id);
     if (!pdf) return res.status(404).json({ error: "Not found" });
 
+    // compute storage path
+    const storagePath = pdf.storage_path || (SUPABASE_PREFIX ? `${SUPABASE_PREFIX}/${pdf.file_name}` : pdf.file_name);
+
+    if (supabase && storagePath) {
+      try {
+        const { data, error } = await supabase.storage.from(SUPABASE_BUCKET).createSignedUrl(storagePath, 60);
+        if (!error && data?.signedUrl) return res.redirect(302, data.signedUrl);
+        console.error("signed url error:", error);
+      } catch (e) {
+        console.error("createSignedUrl failed:", e);
+      }
+    }
+
+    // Fallback: local file serve
     const file = path.join(PDF_DIR, pdf.file_name);
     if (!fs.existsSync(file)) return res.status(404).json({ error: "File missing" });
 
@@ -733,6 +768,7 @@ app.get("/api/admin/pdfs/:id/download", requireAuth, requireAdmin, async (req, r
   }
 });
 
+// Token download: produce signed URL and consume token; fallback to local stream
 app.get("/api/download/:token", async (req, res) => {
   await db.read();
   const tok = db.data.downloadTokens.find((t) => t.token === req.params.token);
@@ -745,6 +781,23 @@ app.get("/api/download/:token", async (req, res) => {
   if (!pdf) pdf = db.data.pdfs.find((p) => p.id === tok.pdf_id);
   if (!pdf) return res.status(404).json({ error: "Not found" });
 
+  const storagePath = pdf.storage_path || (SUPABASE_PREFIX ? `${SUPABASE_PREFIX}/${pdf.file_name}` : pdf.file_name);
+  if (supabase && storagePath) {
+    try {
+      const { data, error } = await supabase.storage.from(SUPABASE_BUCKET).createSignedUrl(storagePath, 60);
+      if (!error && data?.signedUrl) {
+        // consume token
+        db.data.downloadTokens = db.data.downloadTokens.filter((t) => t.token !== tok.token);
+        await saveDb();
+        return res.redirect(302, data.signedUrl);
+      }
+      console.error("signed url error:", error);
+    } catch (e) {
+      console.error("createSignedUrl failed:", e);
+    }
+  }
+
+  // fallback local
   const file = path.join(PDF_DIR, pdf.file_name);
   if (!fs.existsSync(file)) return res.status(404).json({ error: "File missing" });
 
@@ -943,12 +996,21 @@ async function removePdfById(id) {
   } catch {}
   db.data.downloadTokens = db.data.downloadTokens.filter((t) => t.pdf_id !== p.id);
 
-  // delete row in supabase if configured
+  // delete row & storage object in supabase if configured
   if (supabase) {
     try {
+      // delete storage object if storage_path exists
+      const storagePath = p.storage_path || (SUPABASE_PREFIX ? `${SUPABASE_PREFIX}/${p.file_name}` : p.file_name);
+      if (storagePath) {
+        try {
+          const { error: remErr } = await supabase.storage.from(SUPABASE_BUCKET).remove([storagePath]);
+          if (remErr) console.error("Warning: failed to remove storage object:", remErr);
+        } catch (e) {
+          console.error("Warning: storage remove failed:", e?.message || e);
+        }
+      }
+
       await deletePdfRowFromDb(p.id);
-      // optionally remove storage object in bucket if you used upload-to-supabase (not implemented automatically here)
-      // await supabase.storage.from(SUPABASE_BUCKET).remove([p.file_name]);
     } catch (e) {
       console.error("Warning: failed to delete pdf row from Supabase:", e?.message || e);
     }
@@ -1027,19 +1089,17 @@ app.post("/api/admin/pdf", requireAuth, requireAdmin, uploadSingleFlexible, asyn
       price_cents: PRICE_CENTS,
       status: "unsold",
       file_name: filename,
+      storage_path: SUPABASE_PREFIX ? `${SUPABASE_PREFIX}/${filename}` : filename,
       created_at: nowISO(),
     };
 
     if (supabase) {
       try {
-        // upload file to Supabase storage bucket as well (attempt)
+        // upload file buffer to Supabase storage (avoids duplex issue)
         try {
-          const fileStream = fs.createReadStream(dest);
-          // Supabase client expects a File/Buffer; Node SDK supports passing a stream under the hood
-          await supabase.storage.from(SUPABASE_BUCKET).upload(filename, fileStream, { upsert: false });
+          await uploadFileBufferToSupabase(dest, filename);
         } catch (uploadErr) {
-          // don't block metadata insert if storage upload fails; log and continue
-          console.error("Warning: failed to upload to Supabase storage:", uploadErr);
+          console.error("Warning: failed to upload to Supabase storage:", uploadErr?.message || uploadErr);
         }
 
         const created = await insertPdfToDb(itemRow);
@@ -1111,17 +1171,17 @@ app.post("/api/admin/pdf-batch", requireAuth, requireAdmin, uploadAny, async (re
           price_cents: PRICE_CENTS,
           status: "unsold",
           file_name: filename,
+          storage_path: SUPABASE_PREFIX ? `${SUPABASE_PREFIX}/${filename}` : filename,
           created_at: nowISO(),
         };
 
         if (supabase) {
           try {
-            // upload file to Supabase storage
+            // upload file buffer => Supabase storage
             try {
-              const fileStream = fs.createReadStream(dest);
-              await supabase.storage.from(SUPABASE_BUCKET).upload(filename, fileStream, { upsert: false });
+              await uploadFileBufferToSupabase(dest, filename);
             } catch (uploadErr) {
-              console.error("Warning: failed to upload to Supabase storage for", file.originalname, uploadErr);
+              console.error("Warning: failed to upload to Supabase storage for", file.originalname, uploadErr?.message || uploadErr);
             }
 
             const created = await insertPdfToDb(itemRow);
@@ -1217,16 +1277,16 @@ app.post("/api/admin/pdf-batch-zip", requireAuth, requireAdmin, uploadZip, async
           price_cents: PRICE_CENTS,
           status: "unsold",
           file_name: filename,
+          storage_path: SUPABASE_PREFIX ? `${SUPABASE_PREFIX}/${filename}` : filename,
           created_at: nowISO(),
         };
 
         if (supabase) {
           try {
             try {
-              const fileStream = fs.createReadStream(dest);
-              await supabase.storage.from(SUPABASE_BUCKET).upload(filename, fileStream, { upsert: false });
+              await uploadFileBufferToSupabase(dest, filename);
             } catch (uploadErr) {
-              console.error("Warning: failed to upload zip-entry to Supabase storage:", uploadErr);
+              console.error("Warning: failed to upload zip-entry to Supabase storage:", uploadErr?.message || uploadErr);
             }
 
             const created = await insertPdfToDb(itemRow);
@@ -1404,7 +1464,7 @@ if (fs.existsSync(clientIndex)) {
   app.get(/^(?!\/api).+/, (req, res) => res.sendFile(clientIndex));
 } else {
   app.get(/^(?!\/api).+/, (req, res) => {
-    res.status(200).send("Frontend is hosted separately. Visit the Netlify site.");
+        res.status(200).send("Frontend is hosted separately. Visit the Netlify site.");
   });
 }
 
