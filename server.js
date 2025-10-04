@@ -107,6 +107,10 @@ const getJwtFromReq = (req) => {
   if (typeof req.query?.jwt === "string" && req.query.jwt.length > 10) return req.query.jwt;
   return null;
 };
+// NEW: strict UUID check used to prevent uuid-cast errors
+const isUuid = (s) =>
+  typeof s === "string" &&
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s);
 
 /* ---------------- Supabase init & table/bucket names ---------------- */
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
@@ -268,8 +272,9 @@ async function getUserById(id) {
   if (error) return null;
   return data;
 }
+// CHANGED: generate UUIDs for user ids (matches buyer_user_id uuid column)
 async function createUser({ name, email, password_hash }) {
-  const row = { id: nanoid(), name, email, password_hash, balance_cents: 0, is_admin: false, created_at: nowISO() };
+  const row = { id: crypto.randomUUID(), name, email, password_hash, balance_cents: 0, is_admin: false, created_at: nowISO() };
   const { data, error } = await supabase.from(T_USERS).insert(row).select().single();
   if (error) throw error;
   return data;
@@ -425,7 +430,7 @@ app.post("/api/auth/register", async (req, res) => {
     if (existing) return res.status(409).json({ error: "Email already registered" });
 
     const password_hash = await bcrypt.hash(password, 10);
-    const user = await createUser({ name, email, password_hash });
+    const user = await createUser({ name, email, password_hash }); // UUID id
     const token = jwt.sign({ id: user.id, email: user.email, is_admin: !!user.is_admin }, process.env.JWT_SECRET || "dev_secret", { expiresIn: "7d" });
     res.json({ token, user: { id: user.id, name: user.name, email: user.email, balance_cents: user.balance_cents || 0, is_admin: !!user.is_admin } });
   } catch (e) {
@@ -558,8 +563,10 @@ app.get("/api/inventory/count", async (_req, res) => {
 });
 
 /* ---------------- Library ---------------- */
+// NEW: avoid uuid cast error for legacy nanoid accounts
 app.get("/api/me/library", requireAuth, async (req, res) => {
   try {
+    if (!isUuid(req.user.id)) return res.json({ items: [] });
     const { data, error } = await supabase
       .from(T_PDFS)
       .select("*")
@@ -577,6 +584,7 @@ app.get("/api/me/library", requireAuth, async (req, res) => {
 });
 app.get("/api/library", requireAuth, async (req, res) => {
   try {
+    if (!isUuid(req.user.id)) return res.json({ items: [] });
     const { data, error } = await supabase
       .from(T_PDFS)
       .select("*")
@@ -683,6 +691,10 @@ async function getPdfById(id) {
 
 // Single purchase with optimistic locking
 app.post("/api/purchase/single/:pdfId", requireAuth, async (req, res) => {
+  // NEW: fail fast for legacy non-UUID users
+  if (!isUuid(req.user.id)) {
+    return res.status(400).json({ error: "This account cannot purchase until upgraded to a UUID user. Please create a new account." });
+  }
   const release = await mutex.acquire();
   try {
     const pdfId = String(req.params.pdfId || "");
@@ -691,7 +703,7 @@ app.post("/api/purchase/single/:pdfId", requireAuth, async (req, res) => {
     let pdf = await getPdfById(pdfId);
     if (!pdf) return res.status(404).json({ error: "PDF not found" });
 
-    // ADDED: ensure not already owned
+    // ensure not already owned
     if ((pdf.status ?? "unsold").toString().toLowerCase() !== "unsold" || pdf.buyer_user_id) {
       return res.status(409).json({ error: "PDF not available" });
     }
@@ -711,7 +723,7 @@ app.post("/api/purchase/single/:pdfId", requireAuth, async (req, res) => {
 
     const sold_at = nowISO();
 
-    // 1) Mark PDF sold ONLY if it is still unsold and unowned
+    // Mark PDF sold ONLY if still unsold and unowned
     const { data: soldRow, error: updErr } = await supabase
       .from(T_PDFS)
       .update({ status: "sold", buyer_user_id: user.id, sold_at })
@@ -724,10 +736,10 @@ app.post("/api/purchase/single/:pdfId", requireAuth, async (req, res) => {
     if (updErr) throw updErr;
     if (!soldRow) return res.status(409).json({ error: "PDF not available" });
 
-    // 2) Update user balance (if needed)
+    // Update user balance (if needed)
     if (!isAdmin) await updateUser(user.id, { balance_cents: newBalance });
 
-    // 3) Record transaction
+    // Record transaction
     await insertTransaction({
       id: nanoid(),
       user_id: user.id,
@@ -768,6 +780,10 @@ app.post("/api/purchase/single/:pdfId", requireAuth, async (req, res) => {
 
 // Bulk purchase (best-effort; stops when balance insufficient)
 app.post("/api/purchase/bulk", requireAuth, async (req, res) => {
+  // NEW: fail fast for legacy non-UUID users
+  if (!isUuid(req.user.id)) {
+    return res.status(400).json({ error: "This account cannot purchase until upgraded to a UUID user. Please create a new account." });
+  }
   const release = await mutex.acquire();
   try {
     const ids = Array.isArray(req.body?.pdf_ids) ? req.body.pdf_ids.map(String) : [];
@@ -789,7 +805,7 @@ app.post("/api/purchase/bulk", requireAuth, async (req, res) => {
     for (const { id, pdf } of pairs) {
       if (!pdf) { skipped_ids.push({ id, reason: "Not found" }); continue; }
 
-      // ADDED: ensure both unsold and unowned
+      // ensure both unsold and unowned
       if ((pdf.status ?? "unsold").toString().toLowerCase() !== "unsold" || pdf.buyer_user_id) {
         skipped_ids.push({ id, reason: "Not available" }); continue;
       }
