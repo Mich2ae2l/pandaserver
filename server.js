@@ -619,7 +619,7 @@ app.get("/api/inventory/count", async (req, res) => {
       const { data, count, error } = await supabase
         .from(SUPABASE_TABLE)
         .select("id", { count: "exact" })
-        .eq("status", "unsold");
+        .in("status", ["unsold", "UNSOLD", "Unsold"]);
       if (error) throw error;
       return res.json({ remaining: count || (data ? data.length : 0) });
     }
@@ -1280,11 +1280,26 @@ const uploadSingleFlexible = uploadM.fields([
 app.get("/api/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
   try {
     await ensureDb();
+
+    // Try to read "remaining" live from Supabase (tolerant to legacy casing)
+    let remainingLive = null;
+    if (supabase) {
+      const { count, error } = await supabase
+        .from(SUPABASE_TABLE)
+        .select("id", { count: "exact" })
+        .in("status", ["unsold", "UNSOLD", "Unsold"]);
+      if (!error) remainingLive = count ?? null;
+    }
+
     const totalSales = db.data.transactions
       .filter((t) => t.type === "purchase")
       .reduce((s, t) => s + (t.amount_cents || 0), 0) / 100;
+
     const sold = db.data.pdfs.filter((p) => p.status === "sold").length;
-    const remaining = db.data.pdfs.filter((p) => p.status === "unsold").length;
+
+    // Prefer live remaining if available; otherwise fall back to local cache
+    const remaining = remainingLive ?? db.data.pdfs.filter((p) => p.status === "unsold").length;
+
     res.json({
       total_sales_usd: totalSales,
       sold,
@@ -1297,6 +1312,7 @@ app.get("/api/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
     res.status(500).json({ error: "Failed to fetch metrics" });
   }
 });
+
 
 app.get("/api/admin/metrics/rich", requireAuth, requireAdmin, async (req, res) => {
   try {
