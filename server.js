@@ -74,6 +74,35 @@ app.use("/files", express.static(PDF_DIR, {
     res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
   },
 }));
+// add after initial db.read() / initial defaults
+const DEFAULT_DB = {
+  users: [],
+  pdfs: [],
+  transactions: [],
+  downloadTokens: [],
+  resetTokens: [],
+  inbox: [],
+  chats: [],
+};
+
+async function ensureDb() {
+  // read file into memory
+  await ensureDb();
+
+  // If file was empty/corrupt lowdb sometimes sets db.data = null
+  // Ensure we always have the arrays we expect
+  db.data ||= {};
+  db.data.users = Array.isArray(db.data.users) ? db.data.users : [];
+  db.data.pdfs = Array.isArray(db.data.pdfs) ? db.data.pdfs : [];
+  db.data.transactions = Array.isArray(db.data.transactions) ? db.data.transactions : [];
+  db.data.downloadTokens = Array.isArray(db.data.downloadTokens) ? db.data.downloadTokens : [];
+  db.data.resetTokens = Array.isArray(db.data.resetTokens) ? db.data.resetTokens : [];
+  db.data.inbox = Array.isArray(db.data.inbox) ? db.data.inbox : [];
+  db.data.chats = Array.isArray(db.data.chats) ? db.data.chats : [];
+
+  // (persist any corrections immediately)
+  await db.write();
+}
 
 /* ---------------- DB (LowDB fallback) ---------------- */
 const db = new Low(new JSONFile(DB_FILE), {
@@ -85,7 +114,7 @@ const db = new Low(new JSONFile(DB_FILE), {
   inbox: [],
   chats: [],
 });
-await db.read();
+await ensureDb();
 db.data ||= { users: [], pdfs: [], transactions: [], downloadTokens: [], resetTokens: [], inbox: [], chats: [] };
 if (!Array.isArray(db.data.inbox)) db.data.inbox = [];
 if (!Array.isArray(db.data.chats)) db.data.chats = [];
@@ -372,7 +401,7 @@ app.post("/api/auth/forgot", async (req, res) => {
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: "email required" });
 
-  await db.read();
+  await ensureDb();
   const user = db.data.users.find((u) => u.email.toLowerCase() === String(email).toLowerCase());
 
   const token = nanoid();
@@ -406,7 +435,7 @@ app.post("/api/auth/reset", async (req, res) => {
   const { token, new_password } = req.body || {};
   if (!token || !new_password) return res.status(400).json({ error: "token and new_password required" });
 
-  await db.read();
+  await ensureDb();
   const rec = db.data.resetTokens.find((t) => t.token === token);
   if (!rec || Date.now() > rec.expires_at) return res.status(400).json({ error: "Invalid or expired token" });
 
@@ -598,7 +627,7 @@ app.post("/api/now/webhook", express.json({ type: "*/*" }), async (req, res) => 
 app.post("/api/purchase/bulk", requireAuth, async (req, res) => {
   const release = await mutex.acquire();
   try {
-    await db.read();
+    await ensureDb();
     const ids = Array.isArray(req.body?.pdf_ids) ? req.body.pdf_ids.map(String) : [];
     if (ids.length === 0) return res.status(400).json({ error: "pdf_ids required" });
 
@@ -682,7 +711,7 @@ app.post("/api/purchase/bulk", requireAuth, async (req, res) => {
 app.post("/api/purchase/single/:pdfId", requireAuth, async (req, res) => {
   const release = await mutex.acquire();
   try {
-    await db.read();
+    await ensureDb();
 
     // attempt fetch from Supabase first
     let pdf = null;
@@ -739,7 +768,7 @@ app.post("/api/purchase/single/:pdfId", requireAuth, async (req, res) => {
 
 /* ------------- Downloads ------------- */
 app.post("/api/download/token/:pdfId", requireAuth, async (req, res) => {
-  await db.read();
+  await ensureDb();
   let pdf = null;
   if (supabase) {
     try { pdf = await fetchPdfByIdFromDb(req.params.pdfId); } catch (e) { console.error("fetchPdfByIdFromDb error:", e); }
@@ -760,7 +789,7 @@ app.post("/api/download/token/:pdfId", requireAuth, async (req, res) => {
 // admin download: attempt signed URL then fallback to local file
 app.get("/api/admin/pdfs/:id/download", requireAuth, requireAdmin, async (req, res) => {
   try {
-    await db.read();
+    await ensureDb();
 
     let pdf = null;
     if (supabase) {
@@ -802,7 +831,7 @@ app.get("/api/admin/pdfs/:id/download", requireAuth, requireAdmin, async (req, r
 
 // token download: create signed URL and consume token, fallback to local
 app.get("/api/download/:token", async (req, res) => {
-  await db.read();
+  await ensureDb();
   const tok = db.data.downloadTokens.find((t) => t.token === req.params.token);
   if (!tok || Date.now() > tok.expires_at) return res.status(410).json({ error: "Expired token" });
 
@@ -850,7 +879,7 @@ app.post("/api/download/zip", requireAuth, async (req, res) => {
     const ids = Array.isArray(req.body?.pdf_ids) ? req.body.pdf_ids.map(String) : [];
     if (ids.length === 0) return res.status(400).json({ error: "pdf_ids required" });
 
-    await db.read();
+    await ensureDb();
     const isAdmin = !!req.user.is_admin;
 
     const want = new Set(ids);
@@ -1017,7 +1046,7 @@ app.get("/api/admin/pdfs", requireAuth, requireAdmin, async (req, res) => {
 
 /* ================== ADMIN PDF DELETION (helpers & routes) ================== */
 async function removePdfById(id) {
-  await db.read();
+  await ensureDb();
   const idx = db.data.pdfs.findIndex((p) => p.id === String(id));
   if (idx === -1) return { ok: false, id, reason: "Not found" };
   const p = db.data.pdfs[idx];
@@ -1098,7 +1127,7 @@ const uploadAny = uploadM.any();
 // Single PDF upload (admin) - now inserts to Supabase metadata as well
 app.post("/api/admin/pdf", requireAuth, requireAdmin, uploadSingleFlexible, async (req, res) => {
   try {
-    await db.read();
+    await ensureDb();
     const up = (req.files?.file && req.files.file[0]) || (req.files?.pdf && req.files.pdf[0]);
     const { title, state, year } = req.body || {};
     if (!up) return res.status(400).json({ error: "file required (PDF)" });
@@ -1170,7 +1199,7 @@ app.post("/api/admin/pdf-batch", requireAuth, requireAdmin, uploadAny, async (re
   const results = { created: [], skipped: [], errors: [] };
 
   try {
-    await db.read();
+    await ensureDb();
     db.data.pdfs ||= [];
 
     const files = Array.isArray(req.files) ? req.files : [];
@@ -1260,7 +1289,7 @@ app.post("/api/admin/pdf-batch-zip", requireAuth, requireAdmin, uploadZip, async
   try {
     if (!req.file) return res.status(400).json({ error: "zip file required (field 'zip')" });
 
-    await db.read();
+    await ensureDb();
     db.data ||= {};
     db.data.pdfs ||= [];
 
