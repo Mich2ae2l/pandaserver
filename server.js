@@ -1,4 +1,4 @@
-withou harming my code // server.js - Panda API (all data in Supabase)
+// server.js - Panda API (all data in Supabase)
 // Notes:
 // - Supply env vars in .env (no secrets inline!)
 // - Requires the following tables (default names, override with envs):
