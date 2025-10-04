@@ -1,4 +1,6 @@
 // server.js - Supabase-enabled Panda API (patched & normalized)
+// Notes: Uses env variables for secrets. Do NOT paste secret values here in plaintext.
+
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -36,13 +38,14 @@ app.use(
   })
 );
 
-// CORS allow-list via env CORS_ORIGINS (comma-separated).
-const RAW_ALLOWED = process.env.CORS_ORIGINS || "http://localhost:5173,https://sprightly-cannoli-74fc49.netlify.app";
+const RAW_ALLOWED =
+  process.env.CORS_ORIGINS ||
+  "http://localhost:5173,https://sprightly-cannoli-74fc49.netlify.app";
 const ALLOWED = RAW_ALLOWED.split(",").map((s) => s.trim()).filter(Boolean);
 
 const corsOptions = {
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // curl / mobile apps
+    if (!origin) return cb(null, true);
     if (ALLOWED.length === 0) return cb(null, true);
     if (ALLOWED.includes(origin)) return cb(null, true);
     return cb(new Error(`CORS blocked for origin: ${origin}`));
@@ -67,42 +70,12 @@ for (const d of [STORAGE_ROOT, TMP_DIR, PDF_DIR]) {
   try { fs.mkdirSync(d, { recursive: true }); } catch {}
 }
 
-// optionally expose local files over HTTPS as /files/*
 app.use("/files", express.static(PDF_DIR, {
   maxAge: "1y",
   setHeaders: (res) => {
     res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
   },
 }));
-// add after initial db.read() / initial defaults
-const DEFAULT_DB = {
-  users: [],
-  pdfs: [],
-  transactions: [],
-  downloadTokens: [],
-  resetTokens: [],
-  inbox: [],
-  chats: [],
-};
-
-async function ensureDb() {
-  // read file into memory
-  await ensureDb();
-
-  // If file was empty/corrupt lowdb sometimes sets db.data = null
-  // Ensure we always have the arrays we expect
-  db.data ||= {};
-  db.data.users = Array.isArray(db.data.users) ? db.data.users : [];
-  db.data.pdfs = Array.isArray(db.data.pdfs) ? db.data.pdfs : [];
-  db.data.transactions = Array.isArray(db.data.transactions) ? db.data.transactions : [];
-  db.data.downloadTokens = Array.isArray(db.data.downloadTokens) ? db.data.downloadTokens : [];
-  db.data.resetTokens = Array.isArray(db.data.resetTokens) ? db.data.resetTokens : [];
-  db.data.inbox = Array.isArray(db.data.inbox) ? db.data.inbox : [];
-  db.data.chats = Array.isArray(db.data.chats) ? db.data.chats : [];
-
-  // (persist any corrections immediately)
-  await db.write();
-}
 
 /* ---------------- DB (LowDB fallback) ---------------- */
 const db = new Low(new JSONFile(DB_FILE), {
@@ -114,25 +87,53 @@ const db = new Low(new JSONFile(DB_FILE), {
   inbox: [],
   chats: [],
 });
+
+// defaults
+const DEFAULT_DB = {
+  users: [],
+  pdfs: [],
+  transactions: [],
+  downloadTokens: [],
+  resetTokens: [],
+  inbox: [],
+  chats: [],
+};
+
+/* ----------------- ensureDb helper ----------------- */
+async function ensureDb() {
+  // read file into memory
+  await db.read();
+
+  // ensure shape
+  db.data ||= {};
+  db.data.users = Array.isArray(db.data.users) ? db.data.users : [];
+  db.data.pdfs = Array.isArray(db.data.pdfs) ? db.data.pdfs : [];
+  db.data.transactions = Array.isArray(db.data.transactions) ? db.data.transactions : [];
+  db.data.downloadTokens = Array.isArray(db.data.downloadTokens) ? db.data.downloadTokens : [];
+  db.data.resetTokens = Array.isArray(db.data.resetTokens) ? db.data.resetTokens : [];
+  db.data.inbox = Array.isArray(db.data.inbox) ? db.data.inbox : [];
+  db.data.chats = Array.isArray(db.data.chats) ? db.data.chats : [];
+
+  // persist any corrections
+  try { await db.write(); } catch (e) { console.error("ensureDb write failed:", e); }
+}
+
+/* initialize DB on startup */
 await ensureDb();
-db.data ||= { users: [], pdfs: [], transactions: [], downloadTokens: [], resetTokens: [], inbox: [], chats: [] };
-if (!Array.isArray(db.data.inbox)) db.data.inbox = [];
-if (!Array.isArray(db.data.chats)) db.data.chats = [];
 
 /* ---------------- Supabase init & helpers ---------------- */
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 const SUPABASE_TABLE = process.env.SUPABASE_TABLE || "pdfs";
 const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "pdf";
-const SUPABASE_PREFIX = process.env.SUPABASE_STORAGE_PREFIX || ""; // optional prefix inside bucket (e.g. "files")
+const SUPABASE_PREFIX = process.env.SUPABASE_STORAGE_PREFIX || "";
+
 let supabase = null;
 if (SUPABASE_URL && SUPABASE_KEY) {
   supabase = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } });
 }
 
-// helper: safe normalize a pdf row so frontend doesn't see null state, title, etc.
 function normalizePdfRow(row = {}) {
-  // row may be a Supabase Row (object) or a local object
   return {
     id: String(row.id || row._id || row.uuid || nanoid()),
     title: String(row.title || "").trim(),
@@ -151,7 +152,6 @@ function normalizePdfRow(row = {}) {
 
 async function insertPdfToDb(item) {
   if (!supabase) throw new Error("Supabase client not configured");
-  // insert and return full row
   const { data, error } = await supabase.from(SUPABASE_TABLE).insert([item]).select().single();
   if (error) throw error;
   return data;
@@ -175,14 +175,12 @@ async function fetchPdfByIdFromDb(id) {
   if (!supabase) throw new Error("Supabase client not configured");
   const { data, error } = await supabase.from(SUPABASE_TABLE).select("*").eq("id", id).single();
   if (error) {
-    // Normalize not-found
     if (error.code === "PGRST116" || error.status === 406 || error.status === 404 || /No rows/.test(String(error.message || ""))) return null;
     throw error;
   }
   return normalizePdfRow(data);
 }
 
-// Upload helper: read buffer (avoids fetch duplex errors) and upload to Supabase storage
 async function uploadFileBufferToSupabase(localPath, destFilename) {
   if (!supabase) throw new Error("Supabase client not configured");
   const bucket = SUPABASE_BUCKET || "pdf";
@@ -201,10 +199,6 @@ async function uploadFileBufferToSupabase(localPath, destFilename) {
   return { path: destPath, data };
 }
 
-/**
- * Query pdfs with basic filters + pagination
- * returns { total, items }
- */
 async function queryPdfsFromDb({ state, year_min = null, year_max = null, page = 1, per_page = 100, status = "unsold", q = "" } = {}) {
   if (!supabase) throw new Error("Supabase client not configured");
   const pg = Math.max(Number(page) || 1, 1);
@@ -231,8 +225,10 @@ const PRICE_CENTS = 499;
 const mutex = new Mutex();
 const nowISO = () => new Date().toISOString();
 const cents = (n) => Math.round(Number(n || 0));
-const findUserByEmail = (email) => db.data.users.find((u) => u.email && u.email.toLowerCase() === String(email).toLowerCase());
-const saveDb = () => db.write();
+const findUserByEmail = (email) => (db.data.users || []).find((u) => u.email && u.email.toLowerCase() === String(email).toLowerCase());
+const saveDb = async () => {
+  try { await db.write(); } catch (e) { console.error("saveDb failed:", e); throw e; }
+};
 
 function publicBase(req) {
   if (process.env.PUBLIC_BASE_URL) return process.env.PUBLIC_BASE_URL.replace(/\/+$/, "");
@@ -248,6 +244,7 @@ function getJwtFromReq(req) {
 }
 
 /* ---------------- filename parsing ---------------- */
+// (kept your parseFilenameMeta and helpers unchanged)
 const US_STATES = new Set([
   "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA","KS","KY","LA","ME","MD","MA","MI","MN",
   "MS","MO","MT","NE","NV","NH","NJ","NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT","VA",
@@ -257,7 +254,6 @@ const US_STATES = new Set([
 function parseFilenameMeta(originalName) {
   const base = String(originalName).replace(/\.(pdf|png|jpg|jpeg)$/i, "").trim();
 
-  // Pattern: Title_State_YYYY or Title-State-YYYY
   {
     const rx = /^(.*?)\s*[-_ ]+([A-Za-z]{2})\s*[-_ ]+(200[0-7])(?:\D|$)/i;
     const m = base.match(rx);
@@ -272,17 +268,15 @@ function parseFilenameMeta(originalName) {
     }
   }
 
-  // Fallbacks for different naming conventions (underscores + date suffix etc.)
   const parts = base.split("_").map((p) => p.trim()).filter(Boolean);
   if (parts.length >= 3) {
     const lastPart = parts[parts.length - 1];
 
     if (/^\d{8}$/.test(lastPart)) {
-      // e.g., JOHN_DOE_20010101
       const nameParts = parts.slice(0, parts.length - 1);
       if (nameParts.length >= 2) {
         const first = cap(nameParts[0]);
-        const last = cap(nameParts[nameParts.length - 1]);
+        const last = cap(nameParts[nameParts.length - 1] || parts[1]);
         const y = lastPart.slice(0, 4);
         const mm = lastPart.slice(4, 6);
         const dd = lastPart.slice(6, 8);
@@ -356,6 +350,7 @@ const userStreams = new Map();
 const adminStreams = new Set();
 function sseSend(res, event, data) { res.write(`event: ${event}\n`); res.write(`data: ${JSON.stringify(data)}\n\n`); }
 function ssePing(res) { res.write(`: ping\n\n`); }
+
 function pushMessage({ user_id, from, text }) {
   const msg = { id: nanoid(), user_id, from, text: String(text || "").slice(0, MAX_TEXT), created_at: nowISO() };
   db.data.chats.push(msg);
@@ -368,85 +363,112 @@ function pushMessage({ user_id, from, text }) {
 
 /* ---------------- Auth (register/login/me) ---------------- */
 app.post("/api/auth/register", async (req, res) => {
-  const { name, email, password } = req.body || {};
-  if (!name || !email || !password) return res.status(400).json({ error: "name, email, password required" });
-  if (findUserByEmail(email)) return res.status(409).json({ error: "Email already registered" });
+  try {
+    await ensureDb();
+    const { name, email, password } = req.body || {};
+    if (!name || !email || !password) return res.status(400).json({ error: "name, email, password required" });
+    if (findUserByEmail(email)) return res.status(409).json({ error: "Email already registered" });
 
-  const hash = await bcrypt.hash(password, 10);
-  const user = { id: nanoid(), name, email, password_hash: hash, balance_cents: 0, is_admin: false, created_at: nowISO() };
-  db.data.users.push(user);
-  await saveDb();
-  const token = jwt.sign({ id: user.id, email: user.email, is_admin: user.is_admin }, process.env.JWT_SECRET || "dev_secret", { expiresIn: "7d" });
-  res.json({ token, user: { id: user.id, name: user.name, email: user.email, balance_cents: user.balance_cents, is_admin: user.is_admin } });
+    const hash = await bcrypt.hash(password, 10);
+    const user = { id: nanoid(), name, email, password_hash: hash, balance_cents: 0, is_admin: false, created_at: nowISO() };
+    db.data.users.push(user);
+    await saveDb();
+    const token = jwt.sign({ id: user.id, email: user.email, is_admin: user.is_admin }, process.env.JWT_SECRET || "dev_secret", { expiresIn: "7d" });
+    res.json({ token, user: { id: user.id, name: user.name, email: user.email, balance_cents: user.balance_cents, is_admin: user.is_admin } });
+  } catch (e) {
+    console.error("/api/auth/register error:", e);
+    res.status(500).json({ error: "Registration failed" });
+  }
 });
 
 app.post("/api/auth/login", async (req, res) => {
-  const { email, password } = req.body || {};
-  const user = findUserByEmail(email || "");
-  if (!user) return res.status(401).json({ error: "Invalid credentials" });
-  const ok = await bcrypt.compare(password || "", user.password_hash);
-  if (!ok) return res.status(401).json({ error: "Invalid credentials" });
-  const token = jwt.sign({ id: user.id, email: user.email, is_admin: user.is_admin }, process.env.JWT_SECRET || "dev_secret", { expiresIn: "7d" });
-  res.json({ token, user: { id: user.id, name: user.name, email: user.email, balance_cents: user.balance_cents, is_admin: user.is_admin } });
+  try {
+    await ensureDb();
+    const { email, password } = req.body || {};
+    const user = findUserByEmail(email || "");
+    if (!user) return res.status(401).json({ error: "Invalid credentials" });
+    const ok = await bcrypt.compare(password || "", user.password_hash);
+    if (!ok) return res.status(401).json({ error: "Invalid credentials" });
+    const token = jwt.sign({ id: user.id, email: user.email, is_admin: user.is_admin }, process.env.JWT_SECRET || "dev_secret", { expiresIn: "7d" });
+    res.json({ token, user: { id: user.id, name: user.name, email: user.email, balance_cents: user.balance_cents, is_admin: user.is_admin } });
+  } catch (e) {
+    console.error("/api/auth/login error:", e);
+    res.status(500).json({ error: "Login failed" });
+  }
 });
 
-app.get("/api/me", requireAuth, (req, res) => {
-  const u = db.data.users.find((x) => x.id === req.user.id);
-  if (!u) return res.status(404).json({ error: "Not found" });
-  res.json({ id: u.id, name: u.name, email: u.email, balance_cents: u.balance_cents, is_admin: u.is_admin });
+app.get("/api/me", requireAuth, async (req, res) => {
+  try {
+    await ensureDb();
+    const u = db.data.users.find((x) => x.id === req.user.id);
+    if (!u) return res.status(404).json({ error: "Not found" });
+    res.json({ id: u.id, name: u.name, email: u.email, balance_cents: u.balance_cents, is_admin: u.is_admin });
+  } catch (e) {
+    console.error("/api/me error:", e);
+    res.status(500).json({ error: "Failed to fetch user" });
+  }
 });
 
 /* -------- Password reset -------- */
 app.post("/api/auth/forgot", async (req, res) => {
-  const { email } = req.body || {};
-  if (!email) return res.status(400).json({ error: "email required" });
+  try {
+    await ensureDb();
+    const { email } = req.body || {};
+    if (!email) return res.status(400).json({ error: "email required" });
 
-  await ensureDb();
-  const user = db.data.users.find((u) => u.email.toLowerCase() === String(email).toLowerCase());
+    const user = db.data.users.find((u) => u.email.toLowerCase() === String(email).toLowerCase());
+    const token = nanoid();
+    const expires_at = Date.now() + 60 * 60 * 1000;
 
-  const token = nanoid();
-  const expires_at = Date.now() + 60 * 60 * 1000;
+    if (user) {
+      db.data.resetTokens = db.data.resetTokens.filter((t) => t.user_id !== user.id);
+      db.data.resetTokens.push({ token, user_id: user.id, expires_at });
+      await saveDb();
 
-  if (user) {
-    db.data.resetTokens = db.data.resetTokens.filter((t) => t.user_id !== user.id);
-    db.data.resetTokens.push({ token, user_id: user.id, expires_at });
-    await db.write();
+      const base = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
+      const resetLink = `${base}/reset?token=${token}`;
 
-    const base = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
-    const resetLink = `${base}/reset?token=${token}`;
-
-    const mailer = makeMailer();
-    if (mailer) {
-      try {
-        await mailer.sendMail({
-          to: user.email,
-          from: `"Panda" <${process.env.SMTP_USER || "no-reply@localhost"}>`,
-          subject: "Reset your Panda password",
-          text: `Use this link to reset your password (valid 1 hour): ${resetLink}`,
-          html: `<p>Use this link to reset your password (valid 1 hour):</p><p><a href="${resetLink}">${resetLink}</a></p>`,
-        });
-      } catch (e) { console.error("SMTP send error:", e?.message || e); }
+      const mailer = makeMailer();
+      if (mailer) {
+        try {
+          await mailer.sendMail({
+            to: user.email,
+            from: `"Panda" <${process.env.SMTP_USER || "no-reply@localhost"}>`,
+            subject: "Reset your Panda password",
+            text: `Use this link to reset your password (valid 1 hour): ${resetLink}`,
+            html: `<p>Use this link to reset your password (valid 1 hour):</p><p><a href="${resetLink}">${resetLink}</a></p>`,
+          });
+        } catch (e) { console.error("SMTP send error:", e?.message || e); }
+      }
     }
+    res.json({ ok: true, token, expires_at });
+  } catch (e) {
+    console.error("/api/auth/forgot error:", e);
+    res.status(500).json({ error: "Failed to process forgot request" });
   }
-  res.json({ ok: true, token, expires_at });
 });
 
 app.post("/api/auth/reset", async (req, res) => {
-  const { token, new_password } = req.body || {};
-  if (!token || !new_password) return res.status(400).json({ error: "token and new_password required" });
+  try {
+    await ensureDb();
+    const { token, new_password } = req.body || {};
+    if (!token || !new_password) return res.status(400).json({ error: "token and new_password required" });
 
-  await ensureDb();
-  const rec = db.data.resetTokens.find((t) => t.token === token);
-  if (!rec || Date.now() > rec.expires_at) return res.status(400).json({ error: "Invalid or expired token" });
+    const rec = db.data.resetTokens.find((t) => t.token === token);
+    if (!rec || Date.now() > rec.expires_at) return res.status(400).json({ error: "Invalid or expired token" });
 
-  const user = db.data.users.find((u) => u.id === rec.user_id);
-  if (!user) return res.status(400).json({ error: "User not found" });
+    const user = db.data.users.find((u) => u.id === rec.user_id);
+    if (!user) return res.status(400).json({ error: "User not found" });
 
-  const hash = await bcrypt.hash(new_password, 10);
-  user.password_hash = hash;
-  db.data.resetTokens = db.data.resetTokens.filter((t) => t.token !== token);
-  await db.write();
-  res.json({ ok: true });
+    const hash = await bcrypt.hash(new_password, 10);
+    user.password_hash = hash;
+    db.data.resetTokens = db.data.resetTokens.filter((t) => t.token !== token);
+    await saveDb();
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("/api/auth/reset error:", e);
+    res.status(500).json({ error: "Reset failed" });
+  }
 });
 
 /* ------------- Storefront (prefer Supabase, fallback LowDB) ------------- */
@@ -460,14 +482,13 @@ app.get("/api/pdfs", async (req, res) => {
         year_max: year_max ? Number(year_max) : null,
         page: Number(page), per_page: Number(per_page), status: "unsold", q
       });
-      // ensure normalized objects are returned
       const items = (result.items || []).map((p) => ({
         id: p.id, title: p.title, state: p.state || "", year: p.year, price_cents: p.price_cents ?? PRICE_CENTS, file_name: p.file_name || "", storage_path: p.storage_path || ""
       }));
       return res.json({ total: result.total, page: Number(req.query.page || 1), per_page: Number(req.query.per_page || 100), items });
     }
 
-    // fallback LowDB
+    await ensureDb();
     const { state, year_min, year_max, page = 1, per_page = 100 } = req.query;
     let items = db.data.pdfs.filter((p) => String(p.status || "unsold") === "unsold");
     if (state) items = items.filter((p) => String(p.state || "").toLowerCase() === String(state).toLowerCase());
@@ -497,14 +518,16 @@ app.get("/api/inventory/count", async (req, res) => {
       if (error) throw error;
       return res.json({ remaining: count || (data ? data.length : 0) });
     }
+    await ensureDb();
     return res.json({ remaining: db.data.pdfs.filter((p) => p.status === "unsold").length });
   } catch (e) {
     console.error("inventory count supabase error:", e);
+    await ensureDb();
     return res.json({ remaining: db.data.pdfs.filter((p) => p.status === "unsold").length });
   }
 });
 
-// richer library + alias
+// Library endpoints
 app.get("/api/me/library", requireAuth, async (req, res) => {
   try {
     if (supabase) {
@@ -513,6 +536,7 @@ app.get("/api/me/library", requireAuth, async (req, res) => {
       const items = (data || []).map(normalizePdfRow).map(p => ({ id: p.id, title: p.title, state: p.state, year: p.year, price_cents: p.price_cents, storage_path: p.storage_path }));
       return res.json({ items });
     }
+    await ensureDb();
     const owned = db.data.pdfs
       .filter((p) => p.buyer_user_id === req.user.id)
       .sort((a, b) => new Date(b.sold_at || 0) - new Date(a.sold_at || 0))
@@ -531,6 +555,7 @@ app.get("/api/library", requireAuth, async (req, res) => {
       const items = (data || []).map(normalizePdfRow).map(p => ({ id: p.id, title: p.title, state: p.state, year: p.year, price_cents: p.price_cents, storage_path: p.storage_path }));
       return res.json({ items });
     }
+    await ensureDb();
     const owned = db.data.pdfs
       .filter((p) => p.buyer_user_id === req.user.id)
       .sort((a, b) => new Date(b.sold_at || 0) - new Date(a.sold_at || 0))
@@ -550,7 +575,6 @@ app.post("/api/now/create-invoice", requireAuth, async (req, res) => {
     if (!amt || amt < 2) return res.status(400).json({ error: "amount_usd must be >= 2" });
     const orderId = "dep_" + nanoid();
 
-    // webhook should hit your API host (PUBLIC_API_URL) in production.
     const baseApi = (process.env.PUBLIC_API_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
     const baseSite = (process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
     const ipnUrl = `${baseApi}/api/now/webhook`;
@@ -572,6 +596,7 @@ app.post("/api/now/create-invoice", requireAuth, async (req, res) => {
     const data = await resp.json();
     if (!resp.ok) return res.status(400).json({ error: "NOWPayments error", details: data });
 
+    await ensureDb();
     db.data.transactions.push({
       id: nanoid(),
       user_id: req.user.id,
@@ -607,6 +632,7 @@ app.post("/api/now/webhook", express.json({ type: "*/*" }), async (req, res) => 
     const ok = ["confirmed", "finished"].includes(status);
 
     if (ok && orderId) {
+      await ensureDb();
       const tx = db.data.transactions.find((t) => t.provider_order_id === orderId && t.type === "deposit");
       if (tx && tx.status !== "completed") {
         const user = db.data.users.find((u) => u.id === tx.user_id);
@@ -621,85 +647,237 @@ app.post("/api/now/webhook", express.json({ type: "*/*" }), async (req, res) => 
   } catch (e) { console.error(e); res.json({ ok: true }); }
 });
 
-/* ------------- Purchasing ------------- */
+/* ------------------ PURCHASE (single + bulk) ------------------ */
+/* Helpers used by purchase flows */
+async function getPdfById(id) {
+  if (!id) return null;
+  if (supabase) {
+    try {
+      const p = await fetchPdfByIdFromDb(String(id));
+      if (p) return p;
+    } catch (e) {
+      console.error("getPdfById supabase fetch error:", e?.message || e);
+    }
+  }
+  await ensureDb();
+  const local = db.data.pdfs.find((x) => String(x.id) === String(id));
+  if (!local) return null;
+  return {
+    id: String(local.id),
+    title: local.title || "",
+    state: local.state || "",
+    year: local.year ?? null,
+    price_cents: Number(local.price_cents || PRICE_CENTS),
+    status: local.status || "unsold",
+    file_name: local.file_name || "",
+    storage_path: local.storage_path || (local.file_name ? (SUPABASE_PREFIX ? `${SUPABASE_PREFIX}/${local.file_name}` : local.file_name) : ""),
+    created_at: local.created_at || null,
+    sold_at: local.sold_at || null,
+    buyer_user_id: local.buyer_user_id || null,
+    raw: local,
+  };
+}
 
-// Bulk purchase (supports Supabase + LowDB)
+async function upsertLocalPdfCache(normalized) {
+  await ensureDb();
+  const idx = db.data.pdfs.findIndex((p) => String(p.id) === String(normalized.id));
+  const row = {
+    id: String(normalized.id),
+    title: normalized.title || "",
+    state: normalized.state || "",
+    year: normalized.year || null,
+    price_cents: Number(normalized.price_cents || PRICE_CENTS),
+    status: normalized.status || "unsold",
+    file_name: normalized.file_name || "",
+    storage_path: normalized.storage_path || (normalized.file_name ? (SUPABASE_PREFIX ? `${SUPABASE_PREFIX}/${normalized.file_name}` : normalized.file_name) : ""),
+    created_at: normalized.created_at || nowISO(),
+    sold_at: normalized.sold_at || null,
+    buyer_user_id: normalized.buyer_user_id || null,
+  };
+  if (idx === -1) db.data.pdfs.push(row);
+  else db.data.pdfs[idx] = { ...db.data.pdfs[idx], ...row };
+}
+
+// Single purchase
+app.post("/api/purchase/single/:pdfId", requireAuth, async (req, res) => {
+  const release = await mutex.acquire();
+  try {
+    await ensureDb();
+
+    const pdfId = String(req.params.pdfId || "");
+    if (!pdfId) return res.status(400).json({ error: "pdfId required" });
+
+    let pdf = null;
+    try { pdf = await getPdfById(pdfId); } catch (e) { console.error("getPdfById failed:", e); pdf = null; }
+
+    if (!pdf) return res.status(404).json({ error: "PDF not found" });
+    if (String(pdf.status || "unsold") !== "unsold") return res.status(409).json({ error: "PDF not available" });
+
+    const user = db.data.users.find((u) => String(u.id) === String(req.user.id));
+    if (!user) return res.status(401).json({ error: "User not found" });
+
+    const isAdmin = !!req.user.is_admin;
+    const price = Number(pdf.price_cents || PRICE_CENTS);
+
+    if (!isAdmin) {
+      const bal = Number(user.balance_cents || 0);
+      if (bal < price) return res.status(400).json({ error: "Insufficient balance" });
+      user.balance_cents = Math.max(0, Math.round(bal - price));
+    }
+
+    const sold_at = nowISO();
+    let supabaseOk = false;
+    if (supabase) {
+      try {
+        const updated = await updatePdfInDb(pdf.id, { status: "sold", buyer_user_id: user.id, sold_at });
+        supabaseOk = !!updated;
+        if (updated) pdf = normalizePdfRow(updated);
+      } catch (e) {
+        console.error("updatePdfInDb failed; will fallback to local cache:", e?.message || e);
+      }
+    }
+
+    await upsertLocalPdfCache({
+      ...pdf,
+      status: "sold",
+      buyer_user_id: user.id,
+      sold_at,
+    });
+
+    db.data.transactions.push({
+      id: nanoid(),
+      user_id: user.id,
+      type: "purchase",
+      pdf_id: pdf.id,
+      amount_cents: price,
+      currency: "USD",
+      status: "completed",
+      created_at: nowISO(),
+    });
+
+    await saveDb();
+
+    return res.json({
+      ok: true,
+      pdf: {
+        id: pdf.id,
+        title: pdf.title,
+        state: pdf.state,
+        year: pdf.year,
+        storage_path: pdf.storage_path || (pdf.file_name ? (SUPABASE_PREFIX ? `${SUPABASE_PREFIX}/${pdf.file_name}` : pdf.file_name) : ""),
+      },
+      new_balance_cents: user.balance_cents || 0,
+      supabase_synced: supabaseOk,
+    });
+  } catch (e) {
+    console.error("purchase single error:", e);
+    return res.status(500).json({ error: "Purchase failed" });
+  } finally {
+    release();
+  }
+});
+
+// Bulk purchase
 app.post("/api/purchase/bulk", requireAuth, async (req, res) => {
   const release = await mutex.acquire();
   try {
     await ensureDb();
+
     const ids = Array.isArray(req.body?.pdf_ids) ? req.body.pdf_ids.map(String) : [];
     if (ids.length === 0) return res.status(400).json({ error: "pdf_ids required" });
 
-    const user = db.data.users.find((u) => u.id === req.user.id);
+    const user = db.data.users.find((u) => String(u.id) === String(req.user.id));
     if (!user) return res.status(401).json({ error: "User not found" });
-
-    let balance = user.balance_cents || 0;
     const isAdmin = !!req.user.is_admin;
+    let balance = Number(user.balance_cents || 0);
 
     const purchased_ids = [];
     const skipped_ids = [];
 
-    for (const id of ids) {
-      // fetch pdf from supabase first, fallback to local
-      let pdf = null;
-      if (supabase) {
-        try { pdf = await fetchPdfByIdFromDb(id); } catch (e) { console.error("fetchPdfByIdFromDb error:", e); }
-      }
-      if (!pdf) pdf = db.data.pdfs.find((p) => p.id === id);
+    // Pre-fetch
+    const pdfLookups = await Promise.all(ids.map((id) => getPdfById(id).catch((e) => { console.error("pdf fetch err:", e); return null; })));
+    const pairs = ids.map((id, i) => ({ id, pdf: pdfLookups[i] }));
 
-      if (!pdf || pdf.status !== "unsold") {
+    const affordable_count = isAdmin ? Infinity : Math.max(0, Math.floor(balance / PRICE_CENTS));
+    let boughtSoFar = 0;
+
+    for (const { id, pdf } of pairs) {
+      if (!pdf) {
+        skipped_ids.push({ id, reason: "Not found" });
+        continue;
+      }
+      if (String(pdf.status || "unsold") !== "unsold") {
         skipped_ids.push({ id, reason: "Not available" });
         continue;
       }
 
-      if (!isAdmin && balance < PRICE_CENTS) {
+      if (!isAdmin && boughtSoFar >= affordable_count) {
         skipped_ids.push({ id, reason: "Insufficient funds" });
         continue;
       }
 
-      // Update Supabase (if present)
+      const price = Number(pdf.price_cents || PRICE_CENTS);
+      if (!isAdmin && balance < price) {
+        skipped_ids.push({ id, reason: "Insufficient funds" });
+        continue;
+      }
+
       const sold_at = nowISO();
       if (supabase) {
         try {
           await updatePdfInDb(pdf.id, { status: "sold", buyer_user_id: user.id, sold_at });
         } catch (e) {
-          console.error("Failed to update pdf sold state in Supabase:", e);
+          console.error("Bulk updatePdfInDb error (will fallback):", e?.message || e);
+          try {
+            const recheck = await fetchPdfByIdFromDb(pdf.id);
+            if (recheck && String(recheck.status || "") !== "unsold") {
+              skipped_ids.push({ id, reason: "Just sold by someone else" });
+              continue;
+            }
+          } catch (reErr) {
+            console.error("Recheck after supabase update failure failed:", reErr);
+          }
         }
       }
 
-      // Ensure local cache exists and update
-      let localPdf = db.data.pdfs.find((p) => p.id === pdf.id);
-      if (!localPdf) {
-        // insert a cache copy so UI/local flows work
-        localPdf = { id: pdf.id, title: pdf.title || "", state: pdf.state || "", year: pdf.year || null, file_name: pdf.file_name || null, price_cents: pdf.price_cents || PRICE_CENTS, status: "sold", buyer_user_id: user.id, sold_at };
-        db.data.pdfs.push(localPdf);
-      } else {
-        localPdf.status = "sold";
-        localPdf.buyer_user_id = user.id;
-        localPdf.sold_at = sold_at;
-      }
-
-      if (!isAdmin) balance -= PRICE_CENTS;
+      await upsertLocalPdfCache({
+        ...pdf,
+        status: "sold",
+        buyer_user_id: user.id,
+        sold_at,
+      });
 
       db.data.transactions.push({
         id: nanoid(),
         user_id: user.id,
         type: "purchase",
         pdf_id: pdf.id,
-        amount_cents: PRICE_CENTS,
+        amount_cents: price,
         currency: "USD",
         status: "completed",
         created_at: nowISO(),
       });
 
-      purchased_ids.push(id);
+      if (!isAdmin) {
+        balance = Math.max(0, Math.round(balance - price));
+        boughtSoFar++;
+      }
+
+      purchased_ids.push({ id: pdf.id, title: pdf.title || "" });
     }
 
-    if (!isAdmin) user.balance_cents = balance;
+    if (!isAdmin) {
+      user.balance_cents = Math.max(0, Math.round(balance));
+    }
 
     await saveDb();
-    return res.json({ purchased_ids, skipped_ids });
+
+    return res.json({
+      ok: true,
+      purchased: purchased_ids,
+      skipped: skipped_ids,
+      new_balance_cents: user.balance_cents || 0,
+    });
   } catch (e) {
     console.error("Bulk purchase error:", e);
     return res.status(500).json({ error: "Bulk purchase failed" });
@@ -708,82 +886,29 @@ app.post("/api/purchase/bulk", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/api/purchase/single/:pdfId", requireAuth, async (req, res) => {
-  const release = await mutex.acquire();
-  try {
-    await ensureDb();
-
-    // attempt fetch from Supabase first
-    let pdf = null;
-    if (supabase) {
-      try { pdf = await fetchPdfByIdFromDb(String(req.params.pdfId)); } catch (e) { console.error("fetchPdfByIdFromDb error:", e); }
-    }
-    if (!pdf) pdf = db.data.pdfs.find((p) => p.id === String(req.params.pdfId));
-    if (!pdf || pdf.status !== "unsold") return res.status(404).json({ error: "PDF not available" });
-
-    const user = db.data.users.find((u) => u.id === req.user.id);
-    if (!user) return res.status(401).json({ error: "User not found" });
-
-    if (!req.user.is_admin) {
-      if ((user.balance_cents || 0) < PRICE_CENTS) return res.status(400).json({ error: "Insufficient balance" });
-      user.balance_cents = (user.balance_cents || 0) - PRICE_CENTS;
-    }
-
-    const sold_at = nowISO();
-
-    // update supabase if present
-    if (supabase) {
-      try {
-        await updatePdfInDb(pdf.id, { status: "sold", buyer_user_id: user.id, sold_at });
-      } catch (e) { console.error("Failed to update pdf sold state in Supabase:", e); }
-    }
-
-    // ensure local cache updated
-    const localPdf = db.data.pdfs.find((p) => p.id === pdf.id);
-    if (localPdf) {
-      localPdf.status = "sold";
-      localPdf.buyer_user_id = user.id;
-      localPdf.sold_at = sold_at;
-    } else {
-      db.data.pdfs.push({ id: pdf.id, title: pdf.title || "", state: pdf.state || "", year: pdf.year || null, file_name: pdf.file_name || null, price_cents: pdf.price_cents || PRICE_CENTS, status: "sold", buyer_user_id: user.id, sold_at });
-    }
-
-    db.data.transactions.push({
-      id: nanoid(),
-      user_id: user.id,
-      type: "purchase",
-      pdf_id: pdf.id,
-      amount_cents: PRICE_CENTS,
-      currency: "USD",
-      status: "completed",
-      created_at: nowISO(),
-    });
-
-    await saveDb();
-    res.json({ ok: true, pdf: { id: pdf.id, title: pdf.title } });
-  } finally {
-    release();
-  }
-});
-
 /* ------------- Downloads ------------- */
 app.post("/api/download/token/:pdfId", requireAuth, async (req, res) => {
-  await ensureDb();
-  let pdf = null;
-  if (supabase) {
-    try { pdf = await fetchPdfByIdFromDb(req.params.pdfId); } catch (e) { console.error("fetchPdfByIdFromDb error:", e); }
+  try {
+    await ensureDb();
+    let pdf = null;
+    if (supabase) {
+      try { pdf = await fetchPdfByIdFromDb(req.params.pdfId); } catch (e) { console.error("fetchPdfByIdFromDb error:", e); }
+    }
+    if (!pdf) pdf = db.data.pdfs.find((p) => p.id === req.params.pdfId);
+    if (!pdf) return res.status(404).json({ error: "Not found" });
+    if (!req.user.is_admin && pdf.buyer_user_id !== req.user.id) return res.status(403).json({ error: "Purchase required" });
+
+    const token = nanoid();
+    const expires_at = Date.now() + 5 * 60 * 1000;
+    db.data.downloadTokens.push({ token, user_id: req.user.id, pdf_id: pdf.id, expires_at });
+    await saveDb();
+
+    const url = `${publicBase(req)}/api/download/${token}`;
+    res.json({ token, expires_at, url });
+  } catch (e) {
+    console.error("/api/download/token error:", e);
+    res.status(500).json({ error: "Failed to create token" });
   }
-  if (!pdf) pdf = db.data.pdfs.find((p) => p.id === req.params.pdfId);
-  if (!pdf) return res.status(404).json({ error: "Not found" });
-  if (!req.user.is_admin && pdf.buyer_user_id !== req.user.id) return res.status(403).json({ error: "Purchase required" });
-
-  const token = nanoid();
-  const expires_at = Date.now() + 5 * 60 * 1000;
-  db.data.downloadTokens.push({ token, user_id: req.user.id, pdf_id: pdf.id, expires_at });
-  await saveDb();
-
-  const url = `${publicBase(req)}/api/download/${token}`;
-  res.json({ token, expires_at, url });
 });
 
 // admin download: attempt signed URL then fallback to local file
@@ -806,7 +931,6 @@ app.get("/api/admin/pdfs/:id/download", requireAuth, requireAdmin, async (req, r
         if (!error && data?.signedURL) {
           return res.redirect(302, data.signedURL);
         }
-        // Newer SDK returns signedUrl key:
         if (!error && data?.signedUrl) {
           return res.redirect(302, data.signedUrl);
         }
@@ -816,7 +940,6 @@ app.get("/api/admin/pdfs/:id/download", requireAuth, requireAdmin, async (req, r
       }
     }
 
-    // Fallback: local file serve
     const file = path.join(PDF_DIR, pdf.file_name || "");
     if (!pdf.file_name || !fs.existsSync(file)) return res.status(404).json({ error: "File missing" });
 
@@ -829,48 +952,50 @@ app.get("/api/admin/pdfs/:id/download", requireAuth, requireAdmin, async (req, r
   }
 });
 
-// token download: create signed URL and consume token, fallback to local
 app.get("/api/download/:token", async (req, res) => {
-  await ensureDb();
-  const tok = db.data.downloadTokens.find((t) => t.token === req.params.token);
-  if (!tok || Date.now() > tok.expires_at) return res.status(410).json({ error: "Expired token" });
+  try {
+    await ensureDb();
+    const tok = db.data.downloadTokens.find((t) => t.token === req.params.token);
+    if (!tok || Date.now() > tok.expires_at) return res.status(410).json({ error: "Expired token" });
 
-  let pdf = null;
-  if (supabase) {
-    try { pdf = await fetchPdfByIdFromDb(tok.pdf_id); } catch (e) { console.error("fetchPdfByIdFromDb error:", e); }
-  }
-  if (!pdf) pdf = db.data.pdfs.find((p) => p.id === tok.pdf_id);
-  if (!pdf) return res.status(404).json({ error: "Not found" });
-
-  const storagePath = (pdf.storage_path || (pdf.file_name ? (SUPABASE_PREFIX ? `${SUPABASE_PREFIX}/${pdf.file_name}` : pdf.file_name) : "")).replace(/^\/+/, "");
-
-  if (supabase && storagePath) {
-    try {
-      const { data, error } = await supabase.storage.from(SUPABASE_BUCKET).createSignedUrl(storagePath, 60);
-      if (!error && (data?.signedUrl || data?.signedURL)) {
-        // consume token
-        db.data.downloadTokens = db.data.downloadTokens.filter((t) => t.token !== tok.token);
-        await saveDb();
-        return res.redirect(302, data.signedUrl || data.signedURL);
-      }
-      console.error("signed url error:", error, data);
-    } catch (e) {
-      console.error("createSignedUrl failed:", e);
+    let pdf = null;
+    if (supabase) {
+      try { pdf = await fetchPdfByIdFromDb(tok.pdf_id); } catch (e) { console.error("fetchPdfByIdFromDb error:", e); }
     }
+    if (!pdf) pdf = db.data.pdfs.find((p) => p.id === tok.pdf_id);
+    if (!pdf) return res.status(404).json({ error: "Not found" });
+
+    const storagePath = (pdf.storage_path || (pdf.file_name ? (SUPABASE_PREFIX ? `${SUPABASE_PREFIX}/${pdf.file_name}` : pdf.file_name) : "")).replace(/^\/+/, "");
+
+    if (supabase && storagePath) {
+      try {
+        const { data, error } = await supabase.storage.from(SUPABASE_BUCKET).createSignedUrl(storagePath, 60);
+        if (!error && (data?.signedUrl || data?.signedURL)) {
+          db.data.downloadTokens = db.data.downloadTokens.filter((t) => t.token !== tok.token);
+          await saveDb();
+          return res.redirect(302, data.signedUrl || data.signedURL);
+        }
+        console.error("signed url error:", error, data);
+      } catch (e) {
+        console.error("createSignedUrl failed:", e);
+      }
+    }
+
+    const file = path.join(PDF_DIR, pdf.file_name || "");
+    if (!pdf.file_name || !fs.existsSync(file)) return res.status(404).json({ error: "File missing" });
+
+    res.setHeader("Content-Type", "application/octet-stream");
+    const asAttachment = String(req.query.dl || "") === "1";
+    const disp = asAttachment ? "attachment" : "inline";
+    res.setHeader("Content-Disposition", `${disp}; filename="${(pdf.title || pdf.id).replace(/[^a-z0-9_\\-\\.]+/gi, "_")}.pdf"`);
+
+    fs.createReadStream(file).pipe(res);
+    db.data.downloadTokens = db.data.downloadTokens.filter((t) => t.token !== tok.token);
+    await saveDb();
+  } catch (e) {
+    console.error("/api/download/:token error:", e);
+    res.status(500).json({ error: "Download failed" });
   }
-
-  // fallback local
-  const file = path.join(PDF_DIR, pdf.file_name || "");
-  if (!pdf.file_name || !fs.existsSync(file)) return res.status(404).json({ error: "File missing" });
-
-  res.setHeader("Content-Type", "application/octet-stream");
-  const asAttachment = String(req.query.dl || "") === "1";
-  const disp = asAttachment ? "attachment" : "inline";
-  res.setHeader("Content-Disposition", `${disp}; filename="${(pdf.title || pdf.id).replace(/[^a-z0-9_\\-\\.]+/gi, "_")}.pdf"`);
-
-  fs.createReadStream(file).pipe(res);
-  db.data.downloadTokens = db.data.downloadTokens.filter((t) => t.token !== tok.token);
-  await saveDb();
 });
 
 /* === ZIP download of purchased PDFs === */
@@ -912,104 +1037,140 @@ app.post("/api/download/zip", requireAuth, async (req, res) => {
 });
 
 /* ------------- Admin ------------- */
-const upload = multer({ dest: TMP_DIR, limits: { fileSize: 200 * 1024 * 1024 } }); // 200MB per file limit
-const uploadM = upload; // alias
+const upload = multer({ dest: TMP_DIR, limits: { fileSize: 200 * 1024 * 1024 } });
+const uploadM = upload;
 const uploadSingleFlexible = uploadM.fields([{ name: "file", maxCount: 1 }, { name: "pdf", maxCount: 1 }]);
 
-app.get("/api/admin/metrics", requireAuth, requireAdmin, (req, res) => {
-  const totalSales = db.data.transactions.filter((t) => t.type === "purchase").reduce((s, t) => s + t.amount_cents, 0) / 100;
-  const sold = db.data.pdfs.filter((p) => p.status === "sold").length;
-  const remaining = db.data.pdfs.filter((p) => p.status === "unsold").length;
-  res.json({
-    total_sales_usd: totalSales,
-    sold,
-    remaining,
-    users: db.data.users.length,
-    deposits: db.data.transactions.filter((t) => t.type === "deposit" && t.status === "completed").length,
-  });
+app.get("/api/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    await ensureDb();
+    const totalSales = db.data.transactions.filter((t) => t.type === "purchase").reduce((s, t) => s + t.amount_cents, 0) / 100;
+    const sold = db.data.pdfs.filter((p) => p.status === "sold").length;
+    const remaining = db.data.pdfs.filter((p) => p.status === "unsold").length;
+    res.json({
+      total_sales_usd: totalSales,
+      sold,
+      remaining,
+      users: db.data.users.length,
+      deposits: db.data.transactions.filter((t) => t.type === "deposit" && t.status === "completed").length,
+    });
+  } catch (e) {
+    console.error("/api/admin/metrics error:", e);
+    res.status(500).json({ error: "Failed to fetch metrics" });
+  }
 });
 
-app.get("/api/admin/metrics/rich", requireAuth, requireAdmin, (req, res) => {
-  const today = new Date();
-  const days = Number(req.query.days || 30);
-  const dayKey = (d) => d.toISOString().slice(0, 10);
-  const backDates = Array.from({ length: days }).map((_, i) => {
-    const d = new Date(today); d.setDate(d.getDate() - (days - 1 - i)); return dayKey(d);
-  });
-  const salesByDay = Object.fromEntries(backDates.map((k) => [k, 0]));
-  const depositsByDay = Object.fromEntries(backDates.map((k) => [k, 0]));
-  for (const t of db.data.transactions) {
-    if (!t.created_at) continue;
-    const k = dayKey(new Date(t.created_at));
-    if (!(k in salesByDay)) continue;
-    if (t.type === "purchase") salesByDay[k] += Number(t.amount_cents || 0);
-    if (t.type === "deposit" && t.status === "completed") depositsByDay[k] += Number(t.amount_cents || 0);
+app.get("/api/admin/metrics/rich", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    await ensureDb();
+    const today = new Date();
+    const days = Number(req.query.days || 30);
+    const dayKey = (d) => d.toISOString().slice(0, 10);
+    const backDates = Array.from({ length: days }).map((_, i) => {
+      const d = new Date(today); d.setDate(d.getDate() - (days - 1 - i)); return dayKey(d);
+    });
+    const salesByDay = Object.fromEntries(backDates.map((k) => [k, 0]));
+    const depositsByDay = Object.fromEntries(backDates.map((k) => [k, 0]));
+    for (const t of db.data.transactions) {
+      if (!t.created_at) continue;
+      const k = dayKey(new Date(t.created_at));
+      if (!(k in salesByDay)) continue;
+      if (t.type === "purchase") salesByDay[k] += Number(t.amount_cents || 0);
+      if (t.type === "deposit" && t.status === "completed") depositsByDay[k] += Number(t.amount_cents || 0);
+    }
+    const totals = {
+      total_sales_usd: db.data.transactions.filter((t) => t.type === "purchase").reduce((s, t) => s + (t.amount_cents || 0), 0) / 100,
+      sold: db.data.pdfs.filter((p) => p.status === "sold").length,
+      remaining: db.data.pdfs.filter((p) => p.status === "unsold").length,
+      users: db.data.users.length,
+      deposits: db.data.transactions.filter((t) => t.type === "deposit" && t.status === "completed").length,
+    };
+    res.json({
+      ...totals,
+      sales_by_day: backDates.map((k) => ({ date: k, amount_cents: salesByDay[k] })),
+      deposits_by_day: backDates.map((k) => ({ date: k, amount_cents: depositsByDay[k] })),
+    });
+  } catch (e) {
+    console.error("/api/admin/metrics/rich error:", e);
+    res.status(500).json({ error: "Failed to fetch rich metrics" });
   }
-  const totals = {
-    total_sales_usd: db.data.transactions.filter((t) => t.type === "purchase").reduce((s, t) => s + (t.amount_cents || 0), 0) / 100,
-    sold: db.data.pdfs.filter((p) => p.status === "sold").length,
-    remaining: db.data.pdfs.filter((p) => p.status === "unsold").length,
-    users: db.data.users.length,
-    deposits: db.data.transactions.filter((t) => t.type === "deposit" && t.status === "completed").length,
-  };
-  res.json({
-    ...totals,
-    sales_by_day: backDates.map((k) => ({ date: k, amount_cents: salesByDay[k] })),
-    deposits_by_day: backDates.map((k) => ({ date: k, amount_cents: depositsByDay[k] })),
-  });
 });
 
-// Users list / patch / delete (unchanged behavior)
-app.get("/api/admin/users", requireAuth, requireAdmin, (req, res) => {
-  let { page = 1, per_page = 50, q = "" } = req.query;
-  page = Math.max(Number(page) || 1, 1);
-  per_page = Math.min(Math.max(Number(per_page) || 50, 1), 500);
+// admin users list/patch/delete
+app.get("/api/admin/users", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    await ensureDb();
+    let { page = 1, per_page = 50, q = "" } = req.query;
+    page = Math.max(Number(page) || 1, 1);
+    per_page = Math.min(Math.max(Number(per_page) || 50, 1), 500);
 
-  let list = db.data.users.slice();
-  if (q) {
-    const t = String(q).toLowerCase();
-    list = list.filter((u) => String(u.name || "").toLowerCase().includes(t) || String(u.email || "").toLowerCase().includes(t));
+    let list = db.data.users.slice();
+    if (q) {
+      const t = String(q).toLowerCase();
+      list = list.filter((u) => String(u.name || "").toLowerCase().includes(t) || String(u.email || "").toLowerCase().includes(t));
+    }
+    const total = list.length;
+    const start = (page - 1) * per_page;
+    const items = list.slice(start, start + per_page).map((u) => ({
+      id: u.id, name: u.name, email: u.email, balance_cents: u.balance_cents || 0, is_admin: !!u.is_admin, created_at: u.created_at,
+    }));
+    res.json({ total, page, per_page, items });
+  } catch (e) {
+    console.error("/api/admin/users error:", e);
+    res.status(500).json({ error: "Failed to list users" });
   }
-  const total = list.length;
-  const start = (page - 1) * per_page;
-  const items = list.slice(start, start + per_page).map((u) => ({
-    id: u.id, name: u.name, email: u.email, balance_cents: u.balance_cents || 0, is_admin: !!u.is_admin, created_at: u.created_at,
-  }));
-  res.json({ total, page, per_page, items });
 });
 
 app.patch("/api/admin/users/:id", requireAuth, requireAdmin, async (req, res) => {
-  const u = db.data.users.find((x) => x.id === String(req.params.id));
-  if (!u) return res.status(404).json({ error: "Not found" });
-  const { name, email, balance_cents, is_admin } = req.body || {};
-  if (typeof name === "string") u.name = name.trim();
-  if (typeof email === "string") u.email = email.trim();
-  if (balance_cents != null && !Number.isNaN(Number(balance_cents))) {
-    u.balance_cents = Math.max(0, Math.round(Number(balance_cents)));
+  try {
+    await ensureDb();
+    const u = db.data.users.find((x) => x.id === String(req.params.id));
+    if (!u) return res.status(404).json({ error: "Not found" });
+    const { name, email, balance_cents, is_admin } = req.body || {};
+    if (typeof name === "string") u.name = name.trim();
+    if (typeof email === "string") u.email = email.trim();
+    if (balance_cents != null && !Number.isNaN(Number(balance_cents))) {
+      u.balance_cents = Math.max(0, Math.round(Number(balance_cents)));
+    }
+    if (typeof is_admin === "boolean") u.is_admin = is_admin;
+    await saveDb();
+    res.json({ id: u.id, name: u.name, email: u.email, balance_cents: u.balance_cents || 0, is_admin: !!u.is_admin, created_at: u.created_at });
+  } catch (e) {
+    console.error("/api/admin/users/:id patch error:", e);
+    res.status(500).json({ error: "Failed to patch user" });
   }
-  if (typeof is_admin === "boolean") u.is_admin = is_admin;
-  await db.write();
-  res.json({ id: u.id, name: u.name, email: u.email, balance_cents: u.balance_cents || 0, is_admin: !!u.is_admin, created_at: u.created_at });
 });
 
 app.delete("/api/admin/users/:id", requireAuth, requireAdmin, async (req, res) => {
-  const id = String(req.params.id);
-  const idx = db.data.users.findIndex((x) => x.id === id);
-  if (idx === -1) return res.status(404).json({ error: "Not found" });
-  db.data.pdfs.forEach((p) => { if (p.buyer_user_id === id) p.buyer_user_id = null; });
-  db.data.resetTokens = db.data.resetTokens.filter((t) => t.user_id !== id);
-  db.data.downloadTokens = db.data.downloadTokens.filter((t) => t.user_id !== id);
-  db.data.transactions.forEach((t) => { if (t.user_id === id) t.user_id = null; });
-  const [removed] = db.data.users.splice(idx, 1);
-  await db.write();
-  res.json({ ok: true, removed: { id: removed.id, email: removed.email } });
+  try {
+    await ensureDb();
+    const id = String(req.params.id);
+    const idx = db.data.users.findIndex((x) => x.id === id);
+    if (idx === -1) return res.status(404).json({ error: "Not found" });
+    db.data.pdfs.forEach((p) => { if (p.buyer_user_id === id) p.buyer_user_id = null; });
+    db.data.resetTokens = db.data.resetTokens.filter((t) => t.user_id !== id);
+    db.data.downloadTokens = db.data.downloadTokens.filter((t) => t.user_id !== id);
+    db.data.transactions.forEach((t) => { if (t.user_id === id) t.user_id = null; });
+    const [removed] = db.data.users.splice(idx, 1);
+    await saveDb();
+    res.json({ ok: true, removed: { id: removed.id, email: removed.email } });
+  } catch (e) {
+    console.error("/api/admin/users/:id delete error:", e);
+    res.status(500).json({ error: "Failed to delete user" });
+  }
 });
 
-app.get("/api/admin/transactions", requireAuth, requireAdmin, (req, res) => {
-  res.json({ items: db.data.transactions.slice().reverse().slice(0, 500) });
+app.get("/api/admin/transactions", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    await ensureDb();
+    res.json({ items: db.data.transactions.slice().reverse().slice(0, 500) });
+  } catch (e) {
+    console.error("/api/admin/transactions error:", e);
+    res.status(500).json({ error: "Failed to fetch transactions" });
+  }
 });
 
-// FAST admin list - prefer Supabase
+// Admin PDFs list
 app.get("/api/admin/pdfs", requireAuth, requireAdmin, async (req, res) => {
   try {
     if (supabase) {
@@ -1019,6 +1180,7 @@ app.get("/api/admin/pdfs", requireAuth, requireAdmin, async (req, res) => {
       return res.json({ total: result.total, page: Number(page), per_page: Number(per_page), items });
     }
 
+    await ensureDb();
     let { page = 1, per_page = 60, q = "", state = "", status = "", year_min, year_max } = req.query;
     page = Math.max(Number(page) || 1, 1);
     per_page = Math.min(Math.max(Number(per_page) || 60, 1), 500);
@@ -1060,7 +1222,6 @@ async function removePdfById(id) {
   }
   db.data.downloadTokens = db.data.downloadTokens.filter((t) => t.pdf_id !== p.id);
 
-  // delete row & storage object in supabase if configured
   if (supabase) {
     try {
       const storagePath = p.storage_path || (p.file_name ? (SUPABASE_PREFIX ? `${SUPABASE_PREFIX}/${p.file_name}` : p.file_name) : "");
@@ -1072,7 +1233,6 @@ async function removePdfById(id) {
           console.error("Warning: storage remove failed:", e?.message || e);
         }
       }
-
       await deletePdfRowFromDb(p.id);
     } catch (e) {
       console.error("Warning: failed to delete pdf row from Supabase:", e?.message || e);
@@ -1080,51 +1240,81 @@ async function removePdfById(id) {
   }
 
   db.data.pdfs.splice(idx, 1);
-  await db.write();
+  await saveDb();
   return { ok: true, id };
 }
+
 app.post("/api/admin/pdfs/delete", requireAuth, requireAdmin, async (req, res) => {
-  const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String) : [];
-  if (ids.length === 0) return res.status(400).json({ error: "ids (array) required" });
-  const results = { removed: [], skipped: [] };
-  for (const id of ids) {
-    const r = await removePdfById(id);
-    if (r.ok) results.removed.push(id);
-    else results.skipped.push({ id, reason: r.reason || "Not found" });
+  try {
+    await ensureDb();
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String) : [];
+    if (ids.length === 0) return res.status(400).json({ error: "ids (array) required" });
+    const results = { removed: [], skipped: [] };
+    for (const id of ids) {
+      const r = await removePdfById(id);
+      if (r.ok) results.removed.push(id);
+      else results.skipped.push({ id, reason: r.reason || "Not found" });
+    }
+    res.json(results);
+  } catch (e) {
+    console.error("/api/admin/pdfs/delete error:", e);
+    res.status(500).json({ error: "Delete failed" });
   }
-  res.json(results);
 });
 app.delete("/api/admin/pdfs", requireAuth, requireAdmin, async (req, res) => {
-  const ids = String(req.query.ids || "").split(",").map(s => s.trim()).filter(Boolean);
-  if (ids.length === 0) return res.status(400).json({ error: "ids query required" });
-  const results = { removed: [], skipped: [] };
-  for (const id of ids) {
-    const r = await removePdfById(id);
-    if (r.ok) results.removed.push(id);
-    else results.skipped.push({ id, reason: r.reason || "Not found" });
+  try {
+    await ensureDb();
+    const ids = String(req.query.ids || "").split(",").map(s => s.trim()).filter(Boolean);
+    if (ids.length === 0) return res.status(400).json({ error: "ids query required" });
+    const results = { removed: [], skipped: [] };
+    for (const id of ids) {
+      const r = await removePdfById(id);
+      if (r.ok) results.removed.push(id);
+      else results.skipped.push({ id, reason: r.reason || "Not found" });
+    }
+    res.json(results);
+  } catch (e) {
+    console.error("/api/admin/pdfs delete query error:", e);
+    res.status(500).json({ error: "Delete failed" });
   }
-  res.json(results);
 });
 app.delete("/api/admin/pdfs/:id", requireAuth, requireAdmin, async (req, res) => {
-  const r = await removePdfById(req.params.id);
-  if (!r.ok) return res.status(404).json({ error: "Not found" });
-  res.json({ ok: true, id: r.id });
+  try {
+    await ensureDb();
+    const r = await removePdfById(req.params.id);
+    if (!r.ok) return res.status(404).json({ error: "Not found" });
+    res.json({ ok: true, id: r.id });
+  } catch (e) {
+    console.error("/api/admin/pdfs/:id delete error:", e);
+    res.status(500).json({ error: "Delete failed" });
+  }
 });
 app.delete("/api/admin/pdf/:id", requireAuth, requireAdmin, async (req, res) => {
-  const r = await removePdfById(req.params.id);
-  if (!r.ok) return res.status(404).json({ error: "Not found" });
-  res.json({ ok: true, id: r.id });
+  try {
+    await ensureDb();
+    const r = await removePdfById(req.params.id);
+    if (!r.ok) return res.status(404).json({ error: "Not found" });
+    res.json({ ok: true, id: r.id });
+  } catch (e) {
+    console.error("/api/admin/pdf/:id delete error:", e);
+    res.status(500).json({ error: "Delete failed" });
+  }
 });
 app.post("/api/admin/pdfs/:id/delete", requireAuth, requireAdmin, async (req, res) => {
-  const r = await removePdfById(req.params.id);
-  if (!r.ok) return res.status(404).json({ error: "Not found" });
-  res.json({ ok: true, id: r.id });
+  try {
+    await ensureDb();
+    const r = await removePdfById(req.params.id);
+    if (!r.ok) return res.status(404).json({ error: "Not found" });
+    res.json({ ok: true, id: r.id });
+  } catch (e) {
+    console.error("/api/admin/pdfs/:id/delete error:", e);
+    res.status(500).json({ error: "Delete failed" });
+  }
 });
 
 /* ---------- Uploads ---------- */
 const uploadAny = uploadM.any();
 
-// Single PDF upload (admin) - now inserts to Supabase metadata as well
 app.post("/api/admin/pdf", requireAuth, requireAdmin, uploadSingleFlexible, async (req, res) => {
   try {
     await ensureDb();
@@ -1139,12 +1329,10 @@ app.post("/api/admin/pdf", requireAuth, requireAdmin, uploadSingleFlexible, asyn
     try {
       await fs.promises.rename(up.path, dest);
     } catch (err) {
-      // fallback: copy then unlink
       await fs.promises.copyFile(up.path, dest);
       await fs.promises.unlink(up.path);
     }
 
-    // canonical item row to insert into Supabase
     const storage_path = SUPABASE_PREFIX ? `${SUPABASE_PREFIX}/${filename}` : filename;
     const itemRow = {
       title: String(title).trim(),
@@ -1159,7 +1347,6 @@ app.post("/api/admin/pdf", requireAuth, requireAdmin, uploadSingleFlexible, asyn
 
     if (supabase) {
       try {
-        // upload file buffer to Supabase storage (avoids duplex issue)
         try {
           await uploadFileBufferToSupabase(dest, filename);
         } catch (uploadErr) {
@@ -1167,14 +1354,12 @@ app.post("/api/admin/pdf", requireAuth, requireAdmin, uploadSingleFlexible, asyn
         }
 
         const created = await insertPdfToDb(itemRow);
-        // push a local cache entry using the Supabase id
         const item = normalizePdfRow(created);
         db.data.pdfs.push(item);
         await saveDb();
         return res.json({ ok: true, pdf: { id: item.id, title: item.title } });
       } catch (e) {
         console.error("Failed to insert pdf row into Supabase:", e);
-        // Fallback to LowDB so admin still sees it (keeps behavior safe)
         const item = { id: nanoid(), ...itemRow };
         db.data.pdfs.push(item);
         await saveDb();
@@ -1193,7 +1378,6 @@ app.post("/api/admin/pdf", requireAuth, requireAdmin, uploadSingleFlexible, asyn
   }
 });
 
-// Batch upload
 app.post("/api/admin/pdf-batch", requireAuth, requireAdmin, uploadAny, async (req, res) => {
   const release = await mutex.acquire();
   const results = { created: [], skipped: [], errors: [] };
@@ -1242,7 +1426,6 @@ app.post("/api/admin/pdf-batch", requireAuth, requireAdmin, uploadAny, async (re
 
         if (supabase) {
           try {
-            // upload file buffer => Supabase storage
             try {
               await uploadFileBufferToSupabase(dest, filename);
             } catch (uploadErr) {
@@ -1281,7 +1464,7 @@ app.post("/api/admin/pdf-batch", requireAuth, requireAdmin, uploadAny, async (re
   }
 });
 
-// ZIP batch upload: admin uploads a single zip (field name 'zip')
+// ZIP batch upload
 const uploadZip = uploadM.single("zip");
 
 app.post("/api/admin/pdf-batch-zip", requireAuth, requireAdmin, uploadZip, async (req, res) => {
@@ -1327,7 +1510,6 @@ app.post("/api/admin/pdf-batch-zip", requireAuth, requireAdmin, uploadZip, async
         const filename = nanoid() + ext;
         const dest = path.join(PDF_DIR, filename);
 
-        // stream entry to file
         await new Promise((resolve, reject) =>
           entry.stream()
             .pipe(fs.createWriteStream(dest))
@@ -1391,6 +1573,7 @@ app.post("/api/admin/pdf-batch-zip", requireAuth, requireAdmin, uploadZip, async
 /* ===================== CONTACT → INBOX ===================== */
 function sanitizeMessage(s) { if (!s) return ""; const str = String(s); return str.slice(0, 5000); }
 async function createInboxMessage({ name, email, message, source = "contact_page" }) {
+  await ensureDb();
   const msg = { id: nanoid(), name: String(name || "").trim().slice(0, 200), email: String(email || "").trim().slice(0, 320), message: sanitizeMessage(message), created_at: nowISO(), read: false, archived: false, source };
   db.data.inbox.unshift(msg); await saveDb(); return msg;
 }
@@ -1418,63 +1601,92 @@ app.post(["/api/contact", "/api/support", "/api/messages", "/api/admin/inbox"], 
   } catch (e) { console.error(e); res.status(500).json({ error: "Failed to submit message" }); }
 });
 
-app.get("/api/admin/inbox", requireAuth, requireAdmin, (req, res) => {
-  let { page = 1, per_page = 50, q = "", status = "all" } = req.query;
-  page = Math.max(Number(page) || 1, 1);
-  per_page = Math.min(Math.max(Number(per_page) || 50, 1), 500);
-  const term = String(q || "").toLowerCase();
-  let items = db.data.inbox.slice();
+app.get("/api/admin/inbox", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    await ensureDb();
+    let { page = 1, per_page = 50, q = "", status = "all" } = req.query;
+    page = Math.max(Number(page) || 1, 1);
+    per_page = Math.min(Math.max(Number(per_page) || 50, 1), 500);
+    const term = String(q || "").toLowerCase();
+    let items = db.data.inbox.slice();
 
-  if (status === "unread") items = items.filter((m) => !m.read && !m.archived);
-  else if (status === "archived") items = items.filter((m) => !!m.archived);
+    if (status === "unread") items = items.filter((m) => !m.read && !m.archived);
+    else if (status === "archived") items = items.filter((m) => !!m.archived);
 
-  if (term) {
-    items = items.filter(
-      (m) =>
-        String(m.name || "").toLowerCase().includes(term) ||
-        String(m.email || "").toLowerCase().includes(term) ||
-        String(m.message || "").toLowerCase().includes(term)
-    );
+    if (term) {
+      items = items.filter(
+        (m) =>
+          String(m.name || "").toLowerCase().includes(term) ||
+          String(m.email || "").toLowerCase().includes(term) ||
+          String(m.message || "").toLowerCase().includes(term)
+      );
+    }
+
+    const total = items.length;
+    const start = (page - 1) * per_page;
+    const pageItems = items.slice(start, start + per_page);
+    res.json({ total, page, per_page, items: pageItems });
+  } catch (e) {
+    console.error("/api/admin/inbox GET error:", e);
+    res.status(500).json({ error: "Failed to fetch inbox" });
   }
-
-  const total = items.length;
-  const start = (page - 1) * per_page;
-  const pageItems = items.slice(start, start + per_page);
-  res.json({ total, page, per_page, items: pageItems });
 });
 
 app.patch("/api/admin/inbox/:id", requireAuth, requireAdmin, async (req, res) => {
-  const id = String(req.params.id);
-  const m = db.data.inbox.find((x) => x.id === id);
-  if (!m) return res.status(404).json({ error: "Not found" });
-  const { read, archived } = req.body || {};
-  if (typeof read === "boolean") m.read = read;
-  if (typeof archived === "boolean") m.archived = archived;
-  await saveDb();
-  res.json({ ok: true, item: m });
+  try {
+    await ensureDb();
+    const id = String(req.params.id);
+    const m = db.data.inbox.find((x) => x.id === id);
+    if (!m) return res.status(404).json({ error: "Not found" });
+    const { read, archived } = req.body || {};
+    if (typeof read === "boolean") m.read = read;
+    if (typeof archived === "boolean") m.archived = archived;
+    await saveDb();
+    res.json({ ok: true, item: m });
+  } catch (e) {
+    console.error("/api/admin/inbox/:id patch error:", e);
+    res.status(500).json({ error: "Failed to update inbox item" });
+  }
 });
 
 app.delete("/api/admin/inbox/:id", requireAuth, requireAdmin, async (req, res) => {
-  const id = String(req.params.id);
-  const idx = db.data.inbox.findIndex((x) => x.id === id);
-  if (idx === -1) return res.status(404).json({ error: "Not found" });
-  const [removed] = db.data.inbox.splice(idx, 1);
-  await saveDb();
-  res.json({ ok: true, removed: { id: removed.id, email: removed.email } });
+  try {
+    await ensureDb();
+    const id = String(req.params.id);
+    const idx = db.data.inbox.findIndex((x) => x.id === id);
+    if (idx === -1) return res.status(404).json({ error: "Not found" });
+    const [removed] = db.data.inbox.splice(idx, 1);
+    await saveDb();
+    res.json({ ok: true, removed: { id: removed.id, email: removed.email } });
+  } catch (e) {
+    console.error("/api/admin/inbox/:id delete error:", e);
+    res.status(500).json({ error: "Failed to delete inbox item" });
+  }
 });
 
 /* ========= CHAT ROUTES ========= */
-app.post("/api/chat/send", requireAuth, (req, res) => {
-  const text = String(req.body?.text || "").trim();
-  if (!text) return res.status(400).json({ error: "text required" });
-  const msg = pushMessage({ user_id: req.user.id, from: "user", text });
-  res.json({ ok: true, message: msg });
+app.post("/api/chat/send", requireAuth, async (req, res) => {
+  try {
+    const text = String(req.body?.text || "").trim();
+    if (!text) return res.status(400).json({ error: "text required" });
+    const msg = pushMessage({ user_id: req.user.id, from: "user", text });
+    res.json({ ok: true, message: msg });
+  } catch (e) {
+    console.error("/api/chat/send error:", e);
+    res.status(500).json({ error: "Failed to send message" });
+  }
 });
-app.get("/api/chat/history", requireAuth, (req, res) => {
-  const limit = Math.min(Math.max(Number(req.query.limit) || 200, 1), 1000);
-  let items = db.data.chats.filter((m) => m.user_id === req.user.id);
-  items = items.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
-  res.json({ items: items.slice(-limit) });
+app.get("/api/chat/history", requireAuth, async (req, res) => {
+  try {
+    await ensureDb();
+    const limit = Math.min(Math.max(Number(req.query.limit) || 200, 1), 1000);
+    let items = db.data.chats.filter((m) => m.user_id === req.user.id);
+    items = items.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+    res.json({ items: items.slice(-limit) });
+  } catch (e) {
+    console.error("/api/chat/history error:", e);
+    res.status(500).json({ error: "Failed to fetch chat history" });
+  }
 });
 app.get("/api/chat/stream", requireAuth, (req, res) => {
   res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive" });
@@ -1489,21 +1701,33 @@ app.get("/api/chat/stream", requireAuth, (req, res) => {
     if (set) { set.delete(res); if (set.size === 0) userStreams.delete(uid); }
   });
 });
-app.get("/api/admin/chat/:userId/history", requireAuth, requireAdmin, (req, res) => {
-  const userId = String(req.params.userId);
-  const limit = Math.min(Math.max(Number(req.query.limit) || 1000, 1), 5000);
-  let items = db.data.chats.filter((m) => m.user_id === userId);
-  items = items.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
-  res.json({ items: items.slice(-limit) });
+app.get("/api/admin/chat/:userId/history", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    await ensureDb();
+    const userId = String(req.params.userId);
+    const limit = Math.min(Math.max(Number(req.query.limit) || 1000, 1), 5000);
+    let items = db.data.chats.filter((m) => m.user_id === userId);
+    items = items.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+    res.json({ items: items.slice(-limit) });
+  } catch (e) {
+    console.error("/api/admin/chat/:userId/history error:", e);
+    res.status(500).json({ error: "Failed to fetch admin chat history" });
+  }
 });
-app.post("/api/admin/chat/:userId/send", requireAuth, requireAdmin, (req, res) => {
-  const userId = String(req.params.userId);
-  const u = db.data.users.find((x) => x.id === userId);
-  if (!u) return res.status(404).json({ error: "User not found" });
-  const text = String(req.body?.text || "").trim();
-  if (!text) return res.status(400).json({ error: "text required" });
-  const msg = pushMessage({ user_id: userId, from: "admin", text });
-  res.json({ ok: true, message: msg });
+app.post("/api/admin/chat/:userId/send", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    await ensureDb();
+    const userId = String(req.params.userId);
+    const u = db.data.users.find((x) => x.id === userId);
+    if (!u) return res.status(404).json({ error: "User not found" });
+    const text = String(req.body?.text || "").trim();
+    if (!text) return res.status(400).json({ error: "text required" });
+    const msg = pushMessage({ user_id: userId, from: "admin", text });
+    res.json({ ok: true, message: msg });
+  } catch (e) {
+    console.error("/api/admin/chat/:userId/send error:", e);
+    res.status(500).json({ error: "Failed to send admin message" });
+  }
 });
 app.get("/api/admin/chat/stream", requireAuth, requireAdmin, (req, res) => {
   res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive" });
@@ -1538,7 +1762,6 @@ if (fs.existsSync(clientIndex)) {
 app.use("/api", (req, res) => {
   res.status(404).json({ error: "Not found", path: req.originalUrl });
 });
-
 app.listen(PORT, "0.0.0.0", () =>
   console.log(`API listening on 0.0.0.0:${PORT}`)
 );
