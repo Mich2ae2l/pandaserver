@@ -1,6 +1,6 @@
 // server.js - Supabase-enabled Panda API (fixed & consolidated)
 // Notes: Uses env variables for secrets. Do NOT paste secret values here in plaintext.
-
+import os from "os";
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -84,7 +84,18 @@ app.use(
 );
 
 /* ---------------- DB (LowDB fallback) ---------------- */
-const db = new Low(new JSONFile(DB_FILE));
+const DEFAULT_DB = {
+  users: [],
+  pdfs: [],
+  transactions: [],
+  downloadTokens: [],
+  resetTokens: [],
+  inbox: [],
+  chats: [],
+};
+
+const adapter = new JSONFile(DB_FILE);
+const db = new Low(adapter, { defaultData: DEFAULT_DB }); // <-- v7 requires defaultData
 
 /* ----------------- ensureDb helper ----------------- */
 async function ensureDb() {
