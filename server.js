@@ -67,11 +67,13 @@ const corsOptions = {
   origin: (origin, cb) => {
     if (!origin) return cb(null, true);
     if (ALLOWED.length === 0) return cb(null, true);
-    if (ALLOWED.includes(origin)) return cb(null, true);
-    return cb(new Error(`CORS blocked for origin: ${origin}`));
+    const norm = origin.replace(/\/+$/, "");
+    const ok = ALLOWED.some(a => a.replace(/\/+$/, "") === norm);
+    return ok ? cb(null, true) : cb(new Error(`CORS blocked for origin: ${origin}`));
   },
   credentials: true,
-  allowedHeaders: ["Content-Type", "Authorization"],
+  // widened slightly to make preflights happy without changing logic
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept"],
   methods: ["GET", "POST", "DELETE", "PUT", "PATCH", "OPTIONS"],
 };
 app.use(cors(corsOptions));
@@ -296,32 +298,41 @@ async function listTransactions(limit = 500) {
   if (error) throw error;
   return data || [];
 }
+
+/* ------------- FIXED: token helpers (store timestamps as ISO strings) ------------- */
 async function createResetToken({ token, user_id, expires_at }) {
-  const { error } = await supabase.from(T_RESET).insert({ token, user_id, expires_at });
+  const expISO = typeof expires_at === "number" ? new Date(expires_at).toISOString() : String(expires_at);
+  const { error } = await supabase.from(T_RESET).insert({ token, user_id, expires_at: expISO });
   if (error) throw error;
 }
 async function consumeValidResetToken(token) {
-  const now = Date.now();
   const { data, error } = await supabase.from(T_RESET).select("*").eq("token", token).single();
   if (error || !data) return null;
-  if (now > Number(data.expires_at)) return null;
+  const expMs = typeof data.expires_at === "number" ? data.expires_at : Date.parse(data.expires_at);
+  if (!expMs || Date.now() > expMs) {
+    await supabase.from(T_RESET).delete().eq("token", token);
+    return null;
+  }
   await supabase.from(T_RESET).delete().eq("token", token);
   return data;
 }
 async function createDownloadToken({ token, user_id, pdf_id, expires_at }) {
-  const { error } = await supabase.from(T_DLTOK).insert({ token, user_id, pdf_id, expires_at });
+  const expISO = typeof expires_at === "number" ? new Date(expires_at).toISOString() : String(expires_at);
+  const { error } = await supabase.from(T_DLTOK).insert({ token, user_id, pdf_id, expires_at: expISO });
   if (error) throw error;
 }
 async function takeDownloadToken(token) {
   const { data, error } = await supabase.from(T_DLTOK).select("*").eq("token", token).single();
   if (error || !data) return null;
-  if (Date.now() > Number(data.expires_at)) {
+  const expMs = typeof data.expires_at === "number" ? data.expires_at : Date.parse(data.expires_at);
+  if (!expMs || Date.now() > expMs) {
     await supabase.from(T_DLTOK).delete().eq("token", token);
     return null;
   }
   await supabase.from(T_DLTOK).delete().eq("token", token); // one-time
   return data;
 }
+
 async function inboxInsert({ name, email, message, source }) {
   const row = { id: nanoid(), name, email, message, source, read: false, archived: false, created_at: nowISO() };
   const { data, error } = await supabase.from(T_INBOX).insert(row).select().single();
