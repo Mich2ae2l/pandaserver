@@ -1,5 +1,5 @@
 // server.js - Supabase-enabled Panda API (patched & normalized)
-// Notes: Uses env variables for secrets. Do NOT paste secret values here in plaintext.
+// NOTE: No secrets embedded here. Use env vars for keys: JWT_SECRET, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, etc.
 
 import express from "express";
 import cors from "cors";
@@ -38,14 +38,13 @@ app.use(
   })
 );
 
-const RAW_ALLOWED =
-  process.env.CORS_ORIGINS ||
-  "http://localhost:5173,https://sprightly-cannoli-74fc49.netlify.app";
+// CORS allow-list via env CORS_ORIGINS (comma-separated).
+const RAW_ALLOWED = process.env.CORS_ORIGINS || "http://localhost:5173,https://sprightly-cannoli-74fc49.netlify.app";
 const ALLOWED = RAW_ALLOWED.split(",").map((s) => s.trim()).filter(Boolean);
 
 const corsOptions = {
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true);
+    if (!origin) return cb(null, true); // curl / mobile apps
     if (ALLOWED.length === 0) return cb(null, true);
     if (ALLOWED.includes(origin)) return cb(null, true);
     return cb(new Error(`CORS blocked for origin: ${origin}`));
@@ -70,6 +69,7 @@ for (const d of [STORAGE_ROOT, TMP_DIR, PDF_DIR]) {
   try { fs.mkdirSync(d, { recursive: true }); } catch {}
 }
 
+// optionally expose local files over HTTPS as /files/*
 app.use("/files", express.static(PDF_DIR, {
   maxAge: "1y",
   setHeaders: (res) => {
@@ -88,7 +88,6 @@ const db = new Low(new JSONFile(DB_FILE), {
   chats: [],
 });
 
-// defaults
 const DEFAULT_DB = {
   users: [],
   pdfs: [],
@@ -99,12 +98,12 @@ const DEFAULT_DB = {
   chats: [],
 };
 
-/* ----------------- ensureDb helper ----------------- */
 async function ensureDb() {
   // read file into memory
   await db.read();
 
-  // ensure shape
+  // If file was empty/corrupt lowdb sometimes sets db.data = null
+  // Ensure we always have the arrays we expect
   db.data ||= {};
   db.data.users = Array.isArray(db.data.users) ? db.data.users : [];
   db.data.pdfs = Array.isArray(db.data.pdfs) ? db.data.pdfs : [];
@@ -114,7 +113,7 @@ async function ensureDb() {
   db.data.inbox = Array.isArray(db.data.inbox) ? db.data.inbox : [];
   db.data.chats = Array.isArray(db.data.chats) ? db.data.chats : [];
 
-  // persist any corrections
+  // persist any corrections immediately
   try { await db.write(); } catch (e) { console.error("ensureDb write failed:", e); }
 }
 
@@ -133,6 +132,7 @@ if (SUPABASE_URL && SUPABASE_KEY) {
   supabase = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } });
 }
 
+// helper: safe normalize a pdf row so frontend doesn't see null state, title, etc.
 function normalizePdfRow(row = {}) {
   return {
     id: String(row.id || row._id || row.uuid || nanoid()),
@@ -181,6 +181,7 @@ async function fetchPdfByIdFromDb(id) {
   return normalizePdfRow(data);
 }
 
+// Upload helper: read buffer (avoids fetch duplex errors) and upload to Supabase storage
 async function uploadFileBufferToSupabase(localPath, destFilename) {
   if (!supabase) throw new Error("Supabase client not configured");
   const bucket = SUPABASE_BUCKET || "pdf";
@@ -199,6 +200,10 @@ async function uploadFileBufferToSupabase(localPath, destFilename) {
   return { path: destPath, data };
 }
 
+/**
+ * Query pdfs with basic filters + pagination
+ * returns { total, items }
+ */
 async function queryPdfsFromDb({ state, year_min = null, year_max = null, page = 1, per_page = 100, status = "unsold", q = "" } = {}) {
   if (!supabase) throw new Error("Supabase client not configured");
   const pg = Math.max(Number(page) || 1, 1);
@@ -225,10 +230,8 @@ const PRICE_CENTS = 499;
 const mutex = new Mutex();
 const nowISO = () => new Date().toISOString();
 const cents = (n) => Math.round(Number(n || 0));
-const findUserByEmail = (email) => (db.data.users || []).find((u) => u.email && u.email.toLowerCase() === String(email).toLowerCase());
-const saveDb = async () => {
-  try { await db.write(); } catch (e) { console.error("saveDb failed:", e); throw e; }
-};
+const findUserByEmail = (email) => db.data.users.find((u) => u.email && u.email.toLowerCase() === String(email).toLowerCase());
+const saveDb = async () => { try { await db.write(); } catch (e) { console.error("saveDb failed:", e); throw e; } };
 
 function publicBase(req) {
   if (process.env.PUBLIC_BASE_URL) return process.env.PUBLIC_BASE_URL.replace(/\/+$/, "");
@@ -244,7 +247,6 @@ function getJwtFromReq(req) {
 }
 
 /* ---------------- filename parsing ---------------- */
-// (kept your parseFilenameMeta and helpers unchanged)
 const US_STATES = new Set([
   "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA","KS","KY","LA","ME","MD","MA","MI","MN",
   "MS","MO","MT","NE","NV","NH","NJ","NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT","VA",
@@ -254,6 +256,7 @@ const US_STATES = new Set([
 function parseFilenameMeta(originalName) {
   const base = String(originalName).replace(/\.(pdf|png|jpg|jpeg)$/i, "").trim();
 
+  // Pattern: Title_State_YYYY or Title-State-YYYY
   {
     const rx = /^(.*?)\s*[-_ ]+([A-Za-z]{2})\s*[-_ ]+(200[0-7])(?:\D|$)/i;
     const m = base.match(rx);
@@ -268,11 +271,13 @@ function parseFilenameMeta(originalName) {
     }
   }
 
+  // Fallbacks for different naming conventions (underscores + date suffix etc.)
   const parts = base.split("_").map((p) => p.trim()).filter(Boolean);
   if (parts.length >= 3) {
     const lastPart = parts[parts.length - 1];
 
     if (/^\d{8}$/.test(lastPart)) {
+      // e.g., JOHN_DOE_20010101
       const nameParts = parts.slice(0, parts.length - 1);
       if (nameParts.length >= 2) {
         const first = cap(nameParts[0]);
@@ -350,7 +355,6 @@ const userStreams = new Map();
 const adminStreams = new Set();
 function sseSend(res, event, data) { res.write(`event: ${event}\n`); res.write(`data: ${JSON.stringify(data)}\n\n`); }
 function ssePing(res) { res.write(`: ping\n\n`); }
-
 function pushMessage({ user_id, from, text }) {
   const msg = { id: nanoid(), user_id, from, text: String(text || "").slice(0, MAX_TEXT), created_at: nowISO() };
   db.data.chats.push(msg);
@@ -359,6 +363,59 @@ function pushMessage({ user_id, from, text }) {
   if (bucket) { for (const r of bucket) sseSend(r, "message", msg); }
   for (const r of adminStreams) sseSend(r, "message", msg);
   return msg;
+}
+
+/* ---------------- small helpers used in purchase flow ---------------- */
+// getPdfById tries Supabase then local fallback
+async function getPdfById(id) {
+  if (!id) return null;
+  if (supabase) {
+    try {
+      const p = await fetchPdfByIdFromDb(String(id));
+      if (p) return p; // normalized object
+    } catch (e) {
+      console.error("getPdfById supabase fetch error:", e?.message || e);
+    }
+  }
+  // local fallback - ensure db is initialized before using
+  await ensureDb();
+  const local = db.data.pdfs.find((x) => String(x.id) === String(id));
+  if (!local) return null;
+  return {
+    id: String(local.id),
+    title: local.title || "",
+    state: local.state || "",
+    year: local.year ?? null,
+    price_cents: Number(local.price_cents || PRICE_CENTS),
+    status: local.status || "unsold",
+    file_name: local.file_name || "",
+    storage_path: local.storage_path || (local.file_name ? (SUPABASE_PREFIX ? `${SUPABASE_PREFIX}/${local.file_name}` : local.file_name) : ""),
+    created_at: local.created_at || null,
+    sold_at: local.sold_at || null,
+    buyer_user_id: local.buyer_user_id || null,
+    raw: local,
+  };
+}
+
+// upsert local cache
+async function upsertLocalPdfCache(normalized) {
+  await ensureDb();
+  const idx = db.data.pdfs.findIndex((p) => String(p.id) === String(normalized.id));
+  const row = {
+    id: String(normalized.id),
+    title: normalized.title || "",
+    state: normalized.state || "",
+    year: normalized.year || null,
+    price_cents: Number(normalized.price_cents || PRICE_CENTS),
+    status: normalized.status || "unsold",
+    file_name: normalized.file_name || "",
+    storage_path: normalized.storage_path || (normalized.file_name ? (SUPABASE_PREFIX ? `${SUPABASE_PREFIX}/${normalized.file_name}` : normalized.file_name) : ""),
+    created_at: normalized.created_at || nowISO(),
+    sold_at: normalized.sold_at || null,
+    buyer_user_id: normalized.buyer_user_id || null,
+  };
+  if (idx === -1) db.data.pdfs.push(row);
+  else db.data.pdfs[idx] = { ...db.data.pdfs[idx], ...row };
 }
 
 /* ---------------- Auth (register/login/me) ---------------- */
@@ -417,6 +474,7 @@ app.post("/api/auth/forgot", async (req, res) => {
     if (!email) return res.status(400).json({ error: "email required" });
 
     const user = db.data.users.find((u) => u.email.toLowerCase() === String(email).toLowerCase());
+
     const token = nanoid();
     const expires_at = Date.now() + 60 * 60 * 1000;
 
@@ -482,6 +540,7 @@ app.get("/api/pdfs", async (req, res) => {
         year_max: year_max ? Number(year_max) : null,
         page: Number(page), per_page: Number(per_page), status: "unsold", q
       });
+      // ensure normalized objects are returned
       const items = (result.items || []).map((p) => ({
         id: p.id, title: p.title, state: p.state || "", year: p.year, price_cents: p.price_cents ?? PRICE_CENTS, file_name: p.file_name || "", storage_path: p.storage_path || ""
       }));
@@ -525,9 +584,9 @@ app.get("/api/inventory/count", async (req, res) => {
     await ensureDb();
     return res.json({ remaining: db.data.pdfs.filter((p) => p.status === "unsold").length });
   }
-});
+}
 
-// Library endpoints
+// richer library + alias
 app.get("/api/me/library", requireAuth, async (req, res) => {
   try {
     if (supabase) {
@@ -540,7 +599,7 @@ app.get("/api/me/library", requireAuth, async (req, res) => {
     const owned = db.data.pdfs
       .filter((p) => p.buyer_user_id === req.user.id)
       .sort((a, b) => new Date(b.sold_at || 0) - new Date(a.sold_at || 0))
-      .map((p) => ({ id: p.id, title: p.title, state: p.state || "", year: p.year, price_cents: PRICE_CENTS }));
+      .map((p) => ({ id: p.id, title: p.title || "", state: p.state || "", year: p.year, price_cents: PRICE_CENTS }));
     res.json({ items: owned });
   } catch (e) {
     console.error("/api/me/library error:", e);
@@ -575,6 +634,7 @@ app.post("/api/now/create-invoice", requireAuth, async (req, res) => {
     if (!amt || amt < 2) return res.status(400).json({ error: "amount_usd must be >= 2" });
     const orderId = "dep_" + nanoid();
 
+    // webhook should hit your API host (PUBLIC_API_URL) in production.
     const baseApi = (process.env.PUBLIC_API_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
     const baseSite = (process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
     const ipnUrl = `${baseApi}/api/now/webhook`;
@@ -647,58 +707,80 @@ app.post("/api/now/webhook", express.json({ type: "*/*" }), async (req, res) => 
   } catch (e) { console.error(e); res.json({ ok: true }); }
 });
 
-/* ------------------ PURCHASE (single + bulk) ------------------ */
-/* Helpers used by purchase flows */
-async function getPdfById(id) {
-  if (!id) return null;
-  if (supabase) {
-    try {
-      const p = await fetchPdfByIdFromDb(String(id));
-      if (p) return p;
-    } catch (e) {
-      console.error("getPdfById supabase fetch error:", e?.message || e);
+/* ------------------ PURCHASE: safe conditional reservation + guarded fallback ------------------ */
+
+/**
+ * tryReservePdfInSupabase:
+ *  - attempts to update the Supabase row only if status == 'unsold'
+ *  - returns { ok: true, data } on success, or { ok: false, reason, error } on failure
+ */
+async function tryReservePdfInSupabase(pdfId, buyerUserId) {
+  if (!supabase) return { ok: false, reason: "NoSupabase" };
+  try {
+    const patch = { status: "sold", buyer_user_id: buyerUserId, sold_at: nowISO() };
+    const { data, error } = await supabase
+      .from(SUPABASE_TABLE)
+      .update(patch)
+      .eq("id", pdfId)
+      .eq("status", "unsold")
+      .select()
+      .single();
+
+    if (error) {
+      console.error("tryReservePdfInSupabase update error:", error);
+      // Distinguish between zero-match and other errors via error content if possible
+      return { ok: false, reason: "SupabaseError", error };
     }
+    if (!data) {
+      // No row returned -> likely not-unsold or not found
+      return { ok: false, reason: "SupabaseNoMatch" };
+    }
+    return { ok: true, data: normalizePdfRow(data) };
+  } catch (e) {
+    console.error("tryReservePdfInSupabase exception:", e);
+    return { ok: false, reason: "SupabaseException", error: e };
   }
-  await ensureDb();
-  const local = db.data.pdfs.find((x) => String(x.id) === String(id));
-  if (!local) return null;
-  return {
-    id: String(local.id),
-    title: local.title || "",
-    state: local.state || "",
-    year: local.year ?? null,
-    price_cents: Number(local.price_cents || PRICE_CENTS),
-    status: local.status || "unsold",
-    file_name: local.file_name || "",
-    storage_path: local.storage_path || (local.file_name ? (SUPABASE_PREFIX ? `${SUPABASE_PREFIX}/${local.file_name}` : local.file_name) : ""),
-    created_at: local.created_at || null,
-    sold_at: local.sold_at || null,
-    buyer_user_id: local.buyer_user_id || null,
-    raw: local,
-  };
 }
 
-async function upsertLocalPdfCache(normalized) {
+/**
+ * tryReservePdfLocal:
+ *  - guarded local reserve: only mark as sold if currently unsold
+ */
+async function tryReservePdfLocal(pdfId, buyerUserId) {
   await ensureDb();
-  const idx = db.data.pdfs.findIndex((p) => String(p.id) === String(normalized.id));
-  const row = {
-    id: String(normalized.id),
-    title: normalized.title || "",
-    state: normalized.state || "",
-    year: normalized.year || null,
-    price_cents: Number(normalized.price_cents || PRICE_CENTS),
-    status: normalized.status || "unsold",
-    file_name: normalized.file_name || "",
-    storage_path: normalized.storage_path || (normalized.file_name ? (SUPABASE_PREFIX ? `${SUPABASE_PREFIX}/${normalized.file_name}` : normalized.file_name) : ""),
-    created_at: normalized.created_at || nowISO(),
-    sold_at: normalized.sold_at || null,
-    buyer_user_id: normalized.buyer_user_id || null,
-  };
-  if (idx === -1) db.data.pdfs.push(row);
-  else db.data.pdfs[idx] = { ...db.data.pdfs[idx], ...row };
+  const idx = db.data.pdfs.findIndex((p) => String(p.id) === String(pdfId));
+  if (idx === -1) return { ok: false, reason: "NotFoundLocal" };
+  const p = db.data.pdfs[idx];
+  if (String(p.status || "unsold") !== "unsold") return { ok: false, reason: "AlreadySoldLocal" };
+  const sold_at = nowISO();
+  db.data.pdfs[idx] = { ...p, status: "sold", buyer_user_id: buyerUserId, sold_at };
+  return { ok: true, data: db.data.pdfs[idx] };
 }
 
-// Single purchase
+/**
+ * reservePdf:
+ *  - attempt supabase conditional update first
+ *  - if supabase indicates row already sold, bail with AlreadySold
+ *  - if supabase fails/unavailable, fallback to tryReservePdfLocal
+ */
+async function reservePdf(pdfId, buyerUserId) {
+  if (supabase) {
+    const sup = await tryReservePdfInSupabase(pdfId, buyerUserId);
+    if (sup.ok) return { ok: true, source: "supabase", pdf: sup.data };
+    if (sup.reason === "SupabaseNoMatch") return { ok: false, reason: "AlreadySold" };
+    console.warn("reservePdf: supabase reserve failed, falling back to local:", sup.reason || sup.error);
+  }
+
+  const local = await tryReservePdfLocal(pdfId, buyerUserId);
+  if (!local.ok) {
+    if (local.reason === "NotFoundLocal") return { ok: false, reason: "NotFound" };
+    if (local.reason === "AlreadySoldLocal") return { ok: false, reason: "AlreadySold" };
+    return { ok: false, reason: "LocalFailed" };
+  }
+  return { ok: true, source: "local", pdf: local.data };
+}
+
+/* Single purchase: uses reservePdf to prevent double-sells */
 app.post("/api/purchase/single/:pdfId", requireAuth, async (req, res) => {
   const release = await mutex.acquire();
   try {
@@ -707,11 +789,11 @@ app.post("/api/purchase/single/:pdfId", requireAuth, async (req, res) => {
     const pdfId = String(req.params.pdfId || "");
     if (!pdfId) return res.status(400).json({ error: "pdfId required" });
 
+    // try to get current pdf info (prefer supabase)
     let pdf = null;
     try { pdf = await getPdfById(pdfId); } catch (e) { console.error("getPdfById failed:", e); pdf = null; }
-
     if (!pdf) return res.status(404).json({ error: "PDF not found" });
-    if (String(pdf.status || "unsold") !== "unsold") return res.status(409).json({ error: "PDF not available" });
+    if (String(pdf.status || "unsold") !== "unsold") return res.status(409).json({ error: "Not available" });
 
     const user = db.data.users.find((u) => String(u.id) === String(req.user.id));
     if (!user) return res.status(401).json({ error: "User not found" });
@@ -722,33 +804,31 @@ app.post("/api/purchase/single/:pdfId", requireAuth, async (req, res) => {
     if (!isAdmin) {
       const bal = Number(user.balance_cents || 0);
       if (bal < price) return res.status(400).json({ error: "Insufficient balance" });
-      user.balance_cents = Math.max(0, Math.round(bal - price));
+      // don't persist balance until reservation confirmed
+    }
+
+    // reserve via Supabase conditional update -> fallback local
+    const reserved = await reservePdf(pdfId, user.id);
+    if (!reserved.ok) {
+      if (reserved.reason === "AlreadySold") return res.status(409).json({ error: "Not available" });
+      if (reserved.reason === "NotFound") return res.status(404).json({ error: "Not found" });
+      console.error("reservePdf failed:", reserved);
+      return res.status(500).json({ error: "Could not reserve PDF" });
     }
 
     const sold_at = nowISO();
-    let supabaseOk = false;
-    if (supabase) {
-      try {
-        const updated = await updatePdfInDb(pdf.id, { status: "sold", buyer_user_id: user.id, sold_at });
-        supabaseOk = !!updated;
-        if (updated) pdf = normalizePdfRow(updated);
-      } catch (e) {
-        console.error("updatePdfInDb failed; will fallback to local cache:", e?.message || e);
-      }
+    // ensure local cache reflects reservation
+    await upsertLocalPdfCache({ ...reserved.pdf, status: "sold", buyer_user_id: user.id, sold_at });
+
+    // record transaction and deduct balance
+    if (!isAdmin) {
+      user.balance_cents = Math.max(0, Math.round((user.balance_cents || 0) - price));
     }
-
-    await upsertLocalPdfCache({
-      ...pdf,
-      status: "sold",
-      buyer_user_id: user.id,
-      sold_at,
-    });
-
     db.data.transactions.push({
       id: nanoid(),
       user_id: user.id,
       type: "purchase",
-      pdf_id: pdf.id,
+      pdf_id: pdfId,
       amount_cents: price,
       currency: "USD",
       status: "completed",
@@ -760,14 +840,13 @@ app.post("/api/purchase/single/:pdfId", requireAuth, async (req, res) => {
     return res.json({
       ok: true,
       pdf: {
-        id: pdf.id,
-        title: pdf.title,
-        state: pdf.state,
-        year: pdf.year,
-        storage_path: pdf.storage_path || (pdf.file_name ? (SUPABASE_PREFIX ? `${SUPABASE_PREFIX}/${pdf.file_name}` : pdf.file_name) : ""),
+        id: pdfId,
+        title: reserved.pdf.title || "",
+        state: reserved.pdf.state || "",
+        year: reserved.pdf.year || null,
       },
       new_balance_cents: user.balance_cents || 0,
-      supabase_synced: supabaseOk,
+      reserved_via: reserved.source || "local",
     });
   } catch (e) {
     console.error("purchase single error:", e);
@@ -777,81 +856,47 @@ app.post("/api/purchase/single/:pdfId", requireAuth, async (req, res) => {
   }
 });
 
-// Bulk purchase
+/* Bulk purchase: processes in order, reserves each item with reservePdf */
 app.post("/api/purchase/bulk", requireAuth, async (req, res) => {
   const release = await mutex.acquire();
   try {
     await ensureDb();
-
     const ids = Array.isArray(req.body?.pdf_ids) ? req.body.pdf_ids.map(String) : [];
     if (ids.length === 0) return res.status(400).json({ error: "pdf_ids required" });
 
     const user = db.data.users.find((u) => String(u.id) === String(req.user.id));
     if (!user) return res.status(401).json({ error: "User not found" });
+
     const isAdmin = !!req.user.is_admin;
     let balance = Number(user.balance_cents || 0);
 
-    const purchased_ids = [];
-    const skipped_ids = [];
+    const purchased = [];
+    const skipped = [];
 
-    // Pre-fetch
-    const pdfLookups = await Promise.all(ids.map((id) => getPdfById(id).catch((e) => { console.error("pdf fetch err:", e); return null; })));
-    const pairs = ids.map((id, i) => ({ id, pdf: pdfLookups[i] }));
-
-    const affordable_count = isAdmin ? Infinity : Math.max(0, Math.floor(balance / PRICE_CENTS));
-    let boughtSoFar = 0;
-
-    for (const { id, pdf } of pairs) {
-      if (!pdf) {
-        skipped_ids.push({ id, reason: "Not found" });
-        continue;
-      }
-      if (String(pdf.status || "unsold") !== "unsold") {
-        skipped_ids.push({ id, reason: "Not available" });
-        continue;
-      }
-
-      if (!isAdmin && boughtSoFar >= affordable_count) {
-        skipped_ids.push({ id, reason: "Insufficient funds" });
-        continue;
-      }
+    for (const id of ids) {
+      // fresh fetch for metadata
+      let pdf = null;
+      try { pdf = await getPdfById(id); } catch (e) { console.error("getPdfById error (bulk):", e); }
+      if (!pdf) { skipped.push({ id, reason: "Not found" }); continue; }
+      if (String(pdf.status || "unsold") !== "unsold") { skipped.push({ id, reason: "Not available" }); continue; }
 
       const price = Number(pdf.price_cents || PRICE_CENTS);
-      if (!isAdmin && balance < price) {
-        skipped_ids.push({ id, reason: "Insufficient funds" });
-        continue;
+      if (!isAdmin && balance < price) { skipped.push({ id, reason: "Insufficient funds" }); continue; }
+
+      const reserved = await reservePdf(id, user.id);
+      if (!reserved.ok) {
+        if (reserved.reason === "AlreadySold") { skipped.push({ id, reason: "Not available" }); continue; }
+        skipped.push({ id, reason: "Reserve failed" }); console.error("reservePdf failed in bulk:", reserved); continue;
       }
 
-      const sold_at = nowISO();
-      if (supabase) {
-        try {
-          await updatePdfInDb(pdf.id, { status: "sold", buyer_user_id: user.id, sold_at });
-        } catch (e) {
-          console.error("Bulk updatePdfInDb error (will fallback):", e?.message || e);
-          try {
-            const recheck = await fetchPdfByIdFromDb(pdf.id);
-            if (recheck && String(recheck.status || "") !== "unsold") {
-              skipped_ids.push({ id, reason: "Just sold by someone else" });
-              continue;
-            }
-          } catch (reErr) {
-            console.error("Recheck after supabase update failure failed:", reErr);
-          }
-        }
-      }
-
-      await upsertLocalPdfCache({
-        ...pdf,
-        status: "sold",
-        buyer_user_id: user.id,
-        sold_at,
-      });
+      // update cache and transaction
+      await upsertLocalPdfCache({ ...reserved.pdf, status: "sold", buyer_user_id: user.id, sold_at: nowISO() });
 
       db.data.transactions.push({
         id: nanoid(),
         user_id: user.id,
         type: "purchase",
-        pdf_id: pdf.id,
+        pdf_id: id,
         amount_cents: price,
         currency: "USD",
         status: "completed",
@@ -860,24 +905,15 @@ app.post("/api/purchase/bulk", requireAuth, async (req, res) => {
 
       if (!isAdmin) {
         balance = Math.max(0, Math.round(balance - price));
-        boughtSoFar++;
       }
 
-      purchased_ids.push({ id: pdf.id, title: pdf.title || "" });
+      purchased.push({ id, title: reserved.pdf.title || "", reserved_via: reserved.source || "local" });
     }
 
-    if (!isAdmin) {
-      user.balance_cents = Math.max(0, Math.round(balance));
-    }
-
+    if (!isAdmin) user.balance_cents = Math.max(0, Math.round(balance));
     await saveDb();
 
-    return res.json({
-      ok: true,
-      purchased: purchased_ids,
-      skipped: skipped_ids,
-      new_balance_cents: user.balance_cents || 0,
-    });
+    return res.json({ ok: true, purchased, skipped, new_balance_cents: user.balance_cents || 0 });
   } catch (e) {
     console.error("Bulk purchase error:", e);
     return res.status(500).json({ error: "Bulk purchase failed" });
@@ -940,6 +976,7 @@ app.get("/api/admin/pdfs/:id/download", requireAuth, requireAdmin, async (req, r
       }
     }
 
+    // Fallback: local file serve
     const file = path.join(PDF_DIR, pdf.file_name || "");
     if (!pdf.file_name || !fs.existsSync(file)) return res.status(404).json({ error: "File missing" });
 
@@ -981,6 +1018,7 @@ app.get("/api/download/:token", async (req, res) => {
       }
     }
 
+    // fallback local
     const file = path.join(PDF_DIR, pdf.file_name || "");
     if (!pdf.file_name || !fs.existsSync(file)) return res.status(404).json({ error: "File missing" });
 
@@ -1037,8 +1075,8 @@ app.post("/api/download/zip", requireAuth, async (req, res) => {
 });
 
 /* ------------- Admin ------------- */
-const upload = multer({ dest: TMP_DIR, limits: { fileSize: 200 * 1024 * 1024 } });
-const uploadM = upload;
+const upload = multer({ dest: TMP_DIR, limits: { fileSize: 200 * 1024 * 1024 } }); // 200MB per file limit
+const uploadM = upload; // alias
 const uploadSingleFlexible = uploadM.fields([{ name: "file", maxCount: 1 }, { name: "pdf", maxCount: 1 }]);
 
 app.get("/api/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
@@ -1096,7 +1134,7 @@ app.get("/api/admin/metrics/rich", requireAuth, requireAdmin, async (req, res) =
   }
 });
 
-// admin users list/patch/delete
+// Users list / patch / delete (unchanged behavior)
 app.get("/api/admin/users", requireAuth, requireAdmin, async (req, res) => {
   try {
     await ensureDb();
@@ -1170,7 +1208,7 @@ app.get("/api/admin/transactions", requireAuth, requireAdmin, async (req, res) =
   }
 });
 
-// Admin PDFs list
+// FAST admin list - prefer Supabase
 app.get("/api/admin/pdfs", requireAuth, requireAdmin, async (req, res) => {
   try {
     if (supabase) {
@@ -1222,6 +1260,7 @@ async function removePdfById(id) {
   }
   db.data.downloadTokens = db.data.downloadTokens.filter((t) => t.pdf_id !== p.id);
 
+  // delete row & storage object in supabase if configured
   if (supabase) {
     try {
       const storagePath = p.storage_path || (p.file_name ? (SUPABASE_PREFIX ? `${SUPABASE_PREFIX}/${p.file_name}` : p.file_name) : "");
@@ -1233,6 +1272,7 @@ async function removePdfById(id) {
           console.error("Warning: storage remove failed:", e?.message || e);
         }
       }
+
       await deletePdfRowFromDb(p.id);
     } catch (e) {
       console.error("Warning: failed to delete pdf row from Supabase:", e?.message || e);
@@ -1243,7 +1283,6 @@ async function removePdfById(id) {
   await saveDb();
   return { ok: true, id };
 }
-
 app.post("/api/admin/pdfs/delete", requireAuth, requireAdmin, async (req, res) => {
   try {
     await ensureDb();
@@ -1315,6 +1354,7 @@ app.post("/api/admin/pdfs/:id/delete", requireAuth, requireAdmin, async (req, re
 /* ---------- Uploads ---------- */
 const uploadAny = uploadM.any();
 
+// Single PDF upload (admin) - now inserts to Supabase metadata as well
 app.post("/api/admin/pdf", requireAuth, requireAdmin, uploadSingleFlexible, async (req, res) => {
   try {
     await ensureDb();
@@ -1329,10 +1369,12 @@ app.post("/api/admin/pdf", requireAuth, requireAdmin, uploadSingleFlexible, asyn
     try {
       await fs.promises.rename(up.path, dest);
     } catch (err) {
+      // fallback: copy then unlink
       await fs.promises.copyFile(up.path, dest);
       await fs.promises.unlink(up.path);
     }
 
+    // canonical item row to insert into Supabase
     const storage_path = SUPABASE_PREFIX ? `${SUPABASE_PREFIX}/${filename}` : filename;
     const itemRow = {
       title: String(title).trim(),
@@ -1347,6 +1389,7 @@ app.post("/api/admin/pdf", requireAuth, requireAdmin, uploadSingleFlexible, asyn
 
     if (supabase) {
       try {
+        // upload file buffer to Supabase storage (avoids duplex issue)
         try {
           await uploadFileBufferToSupabase(dest, filename);
         } catch (uploadErr) {
@@ -1354,12 +1397,14 @@ app.post("/api/admin/pdf", requireAuth, requireAdmin, uploadSingleFlexible, asyn
         }
 
         const created = await insertPdfToDb(itemRow);
+        // push a local cache entry using the Supabase id
         const item = normalizePdfRow(created);
         db.data.pdfs.push(item);
         await saveDb();
         return res.json({ ok: true, pdf: { id: item.id, title: item.title } });
       } catch (e) {
         console.error("Failed to insert pdf row into Supabase:", e);
+        // Fallback to LowDB so admin still sees it (keeps behavior safe)
         const item = { id: nanoid(), ...itemRow };
         db.data.pdfs.push(item);
         await saveDb();
@@ -1378,6 +1423,7 @@ app.post("/api/admin/pdf", requireAuth, requireAdmin, uploadSingleFlexible, asyn
   }
 });
 
+// Batch upload
 app.post("/api/admin/pdf-batch", requireAuth, requireAdmin, uploadAny, async (req, res) => {
   const release = await mutex.acquire();
   const results = { created: [], skipped: [], errors: [] };
@@ -1426,6 +1472,7 @@ app.post("/api/admin/pdf-batch", requireAuth, requireAdmin, uploadAny, async (re
 
         if (supabase) {
           try {
+            // upload file buffer => Supabase storage
             try {
               await uploadFileBufferToSupabase(dest, filename);
             } catch (uploadErr) {
@@ -1464,7 +1511,7 @@ app.post("/api/admin/pdf-batch", requireAuth, requireAdmin, uploadAny, async (re
   }
 });
 
-// ZIP batch upload
+// ZIP batch upload: admin uploads a single zip (field name 'zip')
 const uploadZip = uploadM.single("zip");
 
 app.post("/api/admin/pdf-batch-zip", requireAuth, requireAdmin, uploadZip, async (req, res) => {
@@ -1510,6 +1557,7 @@ app.post("/api/admin/pdf-batch-zip", requireAuth, requireAdmin, uploadZip, async
         const filename = nanoid() + ext;
         const dest = path.join(PDF_DIR, filename);
 
+        // stream entry to file
         await new Promise((resolve, reject) =>
           entry.stream()
             .pipe(fs.createWriteStream(dest))
