@@ -863,23 +863,74 @@ app.post("/api/purchase/bulk", requireAuth, async (req, res) => {
 });
 
 /* ------------- Downloads ------------- */
+// Replace the whole handler with this one
 app.post("/api/download/token/:pdfId", requireAuth, async (req, res) => {
   try {
     const pdf = await fetchPdfByIdFromDb(req.params.pdfId);
     if (!pdf) return res.status(404).json({ error: "Not found" });
-    if (!req.user.is_admin && pdf.buyer_user_id !== req.user.id) return res.status(403).json({ error: "Purchase required" });
 
+    // Only owner (or admin) can download
+    if (!req.user.is_admin && pdf.buyer_user_id !== req.user.id) {
+      return res.status(403).json({ error: "Purchase required" });
+    }
+
+    // Try preferred path: short-lived Supabase signed URL (works even if download_tokens table is missing)
+    const storagePath = (
+      pdf.storage_path ||
+      (pdf.file_name ? (SUPABASE_PREFIX ? `${SUPABASE_PREFIX}/${pdf.file_name}` : pdf.file_name) : "")
+    ).replace(/^\/+/, "");
+
+    if (storagePath) {
+      const { data, error } = await supabase
+        .storage
+        .from(SUPABASE_BUCKET)
+        .createSignedUrl(storagePath, 120); // 2 minutes
+
+      if (!error && data?.signedUrl) {
+        // Best-effort: also create a token record (non-blocking if your table/schema isn’t ready)
+        try {
+          const token = nanoid();
+          await createDownloadToken({
+            token,
+            user_id: req.user.id,
+            pdf_id: pdf.id,
+            expires_at: Date.now() + 120_000
+          });
+          return res.json({ url: data.signedUrl, token, expires_at: Date.now() + 120_000 });
+        } catch {
+          // Table missing or wrong schema? Still return signed URL.
+          return res.json({ url: data.signedUrl, expires_at: Date.now() + 120_000 });
+        }
+      }
+    }
+
+    // Fallback path: one-time token (original behavior)
     const token = nanoid();
     const expires_at = Date.now() + 5 * 60 * 1000;
     await createDownloadToken({ token, user_id: req.user.id, pdf_id: pdf.id, expires_at });
 
+    // Useful for clients that want to open the redirect endpoint directly
     const url = `${publicBase(req)}/api/download/${token}`;
-    res.json({ token, expires_at, url });
+    return res.json({ token, expires_at, url });
   } catch (e) {
     console.error("/api/download/token error:", e?.message || e);
-    res.status(500).json({ error: "Failed to create token" });
+
+    // Last-chance fallback: try to give a signed URL even when inserts blow up
+    try {
+      const pdf = await fetchPdfByIdFromDb(req.params.pdfId);
+      const storagePath = (
+        pdf?.storage_path ||
+        (pdf?.file_name ? (SUPABASE_PREFIX ? `${SUPABASE_PREFIX}/${pdf.file_name}` : pdf.file_name) : "")
+      ).replace(/^\/+/, "");
+      if (pdf && storagePath) {
+        const { data } = await supabase.storage.from(SUPABASE_BUCKET).createSignedUrl(storagePath, 120);
+        if (data?.signedUrl) return res.json({ url: data.signedUrl, expires_at: Date.now() + 120_000 });
+      }
+    } catch (_) {}
+    return res.status(500).json({ error: "Failed to create token" });
   }
 });
+
 
 app.get("/api/admin/pdfs/:id/download", requireAuth, requireAdmin, async (req, res) => {
   try {
