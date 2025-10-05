@@ -49,8 +49,35 @@ const __dirname = path.dirname(__filename);
 dotenv.config();
 const app = express();
 
-/* ---------------- Basic hardening & CORS ---------------- */
 app.set("trust proxy", true);
+
+/* ---------- CORS FIRST ---------- */
+const allowedExact = new Set([
+  "http://localhost:5173",
+  "https://pandaunc.shop",
+  "https://pandaunc.netlify.app",
+]);
+
+// allow any Netlify preview like https://<buildid>--pandaunc.netlify.app
+const previewRegex = /^https:\/\/[a-z0-9-]+--pandaunc\.netlify\.app$/;
+
+const corsOptions = {
+  origin(origin, cb) {
+    if (!origin) return cb(null, true); // curl/Postman/no Origin
+    const norm = origin.replace(/\/+$/, "");
+    const ok = allowedExact.has(norm) || previewRegex.test(norm);
+    return ok
+      ? cb(null, true)
+      : cb(new Error(`CORS blocked for origin: ${origin}`));
+  },
+  credentials: true,
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept"],
+  methods: ["GET", "POST", "DELETE", "PUT", "PATCH", "OPTIONS"],
+};
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
+
+/* ---------- HELMET AFTER CORS ---------- */
 app.use(
   helmet({
     crossOriginEmbedderPolicy: false,
@@ -59,25 +86,7 @@ app.use(
   })
 );
 
-const RAW_ALLOWED =
-  process.env.CORS_ORIGINS ||
-  "http://localhost:5173,https://pandaunc.shop";
-const ALLOWED = RAW_ALLOWED.split(",").map((s) => s.trim()).filter(Boolean);
-
-const corsOptions = {
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true);
-    if (ALLOWED.length === 0) return cb(null, true);
-    const norm = origin.replace(/\/+$/, "");
-    const ok = ALLOWED.some((a) => a.replace(/\/+$/, "") === norm);
-    return ok ? cb(null, true) : cb(new Error(`CORS blocked for origin: ${origin}`));
-  },
-  credentials: true,
-  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept"],
-  methods: ["GET", "POST", "DELETE", "PUT", "PATCH", "OPTIONS"],
-};
-app.use(cors(corsOptions));
-app.options("*", cors(corsOptions));
+/* ---------- BODY PARSERS ---------- */
 app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true, limit: "5mb" }));
 
