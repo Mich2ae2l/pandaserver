@@ -61,7 +61,7 @@ app.use(
 
 const RAW_ALLOWED =
   process.env.CORS_ORIGINS ||
-  "http://localhost:5173,https://sprightly-cannoli-74fc49.netlify.app";
+  "http://localhost:5173,https://pandaunc.shop";
 const ALLOWED = RAW_ALLOWED.split(",").map((s) => s.trim()).filter(Boolean);
 
 const corsOptions = {
