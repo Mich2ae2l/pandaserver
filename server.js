@@ -93,7 +93,7 @@ for (const d of [STORAGE_ROOT, TMP_DIR, PDF_DIR]) {
 app.use("/files", express.static(PDF_DIR));
 
 /* ---------------- Helpers ---------------- */
-const PRICE_CENTS = 499;
+const PRICE_CENTS = 250;
 const mutex = new Mutex();
 const nowISO = () => new Date().toISOString();
 const cents = (n) => Math.round(Number(n || 0));
@@ -430,7 +430,13 @@ async function pushMessage({ user_id, from, text }) {
   if (bucket) for (const r of bucket) sseSend(r, "message", msg);
   for (const r of adminStreams) sseSend(r, "message", msg);
   return msg;
+// ---- NEW: push a custom event (e.g., balance) to a specific user's SSE stream ----
+function notifyUser(user_id, type, payload) {
+  const bucket = userStreams.get(user_id);
+  if (!bucket) return;
+  for (const r of bucket) sseSend(r, type, payload);
 }
+
 
 /* ---------------- Auth (register/login/me) ---------------- */
 app.post("/api/auth/register", async (req, res) => {
@@ -680,14 +686,15 @@ app.post("/api/now/webhook", express.json({ type: "*/*" }), async (req, res) => 
       const { data: txs } = await supabase.from(T_TX).select("*").eq("provider_order_id", orderId).eq("type", "deposit").limit(1);
       const tx = txs && txs[0];
       if (tx && tx.status !== "completed") {
-        const user = await getUserById(tx.user_id);
-        if (user) {
+     const user = await getUserById(tx.user_id);
+       if (user) {
           const newBal = cents(user.balance_cents) + Math.round(priceAmount * 100);
           await updateUser(user.id, { balance_cents: newBal });
-          await supabase.from(T_TX).update({ status: "completed", updated_at: nowISO(), raw_last: body }).eq("id", tx.id);
-        }
-      }
-    }
+           await supabase.from(T_TX).update({ status: "completed", updated_at: nowISO(), raw_last: body }).eq("id", tx.id);
+           notifyUser(user.id, "balance", { balance_cents: newBal, reason: "deposit" });
+  }
+   }
+     }
     res.json({ ok: true });
   } catch (e) {
     console.error(e);
@@ -748,7 +755,13 @@ app.post("/api/purchase/single/:pdfId", requireAuth, async (req, res) => {
     if (!soldRow) return res.status(409).json({ error: "PDF not available" });
 
     // Update user balance (if needed)
-    if (!isAdmin) await updateUser(user.id, { balance_cents: newBalance });
+if (!isAdmin) {
+  await updateUser(user.id, { balance_cents: newBalance });
+
+  // NEW: live-update the client
+  notifyUser(user.id, "balance", { balance_cents: newBalance, reason: "purchase" });
+}
+;
 
     // Record transaction
     await insertTransaction({
@@ -851,10 +864,15 @@ app.post("/api/purchase/bulk", requireAuth, async (req, res) => {
       purchased_ids.push({ id: pdf.id, title: pdf.title || "" });
     }
 
-    if (!isAdmin) await updateUser(user.id, { balance_cents: balance });
+    if (!isAdmin) {
+  await updateUser(user.id, { balance_cents: balance });
+
+  // NEW: live-update the client
+  notifyUser(user.id, "balance", { balance_cents: balance, reason: "bulk_purchase" });
 
     return res.json({ ok: true, purchased: purchased_ids, skipped: skipped_ids, new_balance_cents: isAdmin ? (user.balance_cents || 0) : balance });
-  } catch (e) {
+  } 
+    catch (e) {
     console.error("Bulk purchase error:", e?.message || e);
     return res.status(500).json({ error: "Bulk purchase failed" });
   } finally {
@@ -1167,7 +1185,9 @@ app.patch("/api/admin/users/:id", requireAuth, requireAdmin, async (req, res) =>
     if (typeof email === "string") patch.email = email.trim();
     if (balance_cents != null && !Number.isNaN(Number(balance_cents))) patch.balance_cents = Math.max(0, Math.round(Number(balance_cents)));
     if (typeof is_admin === "boolean") patch.is_admin = is_admin;
-    const u = await updateUser(String(req.params.id), patch);
+    // NEW: if admin changed balance, live-update that user
+if (patch.balance_cents != null) {
+  notifyUser(u.id, "balance", { balance_cents: u.balance_cents, reason: "admin_patch" });
     res.json({ id: u.id, name: u.name, email: u.email, balance_cents: u.balance_cents || 0, is_admin: !!u.is_admin, created_at: u.created_at });
   } catch (e) {
     console.error("/api/admin/users/:id patch error:", e?.message || e);
