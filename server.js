@@ -424,18 +424,22 @@ const sseSend = (res, event, data) => {
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 };
 const ssePing = (res) => { res.write(`: ping\n\n`); };
+
 async function pushMessage({ user_id, from, text }) {
   const msg = await chatInsert({ user_id, from, text: String(text || "").slice(0, MAX_TEXT) });
   const bucket = userStreams.get(user_id);
   if (bucket) for (const r of bucket) sseSend(r, "message", msg);
   for (const r of adminStreams) sseSend(r, "message", msg);
   return msg;
+}
+
 // ---- NEW: push a custom event (e.g., balance) to a specific user's SSE stream ----
 function notifyUser(user_id, type, payload) {
   const bucket = userStreams.get(user_id);
   if (!bucket) return;
   for (const r of bucket) sseSend(r, type, payload);
 }
+
 
 
 /* ---------------- Auth (register/login/me) ---------------- */
@@ -708,100 +712,6 @@ async function getPdfById(id) {
 }
 
 // Single purchase with optimistic locking
-app.post("/api/purchase/single/:pdfId", requireAuth, async (req, res) => {
-  // NEW: fail fast for legacy non-UUID users
-  if (!isUuid(req.user.id)) {
-    return res.status(400).json({ error: "This account cannot purchase until upgraded to a UUID user. Please create a new account." });
-  }
-  const release = await mutex.acquire();
-  try {
-    const pdfId = String(req.params.pdfId || "");
-    if (!pdfId) return res.status(400).json({ error: "pdfId required" });
-
-    let pdf = await getPdfById(pdfId);
-    if (!pdf) return res.status(404).json({ error: "PDF not found" });
-
-    // ensure not already owned
-    if ((pdf.status ?? "unsold").toString().toLowerCase() !== "unsold" || pdf.buyer_user_id) {
-      return res.status(409).json({ error: "PDF not available" });
-    }
-
-    const user = await getUserById(req.user.id);
-    if (!user) return res.status(401).json({ error: "User not found" });
-
-    const isAdmin = !!req.user.is_admin;
-    const price = Number(pdf.price_cents || PRICE_CENTS);
-
-    // Check balance (non-admin)
-    let newBalance = user.balance_cents || 0;
-    if (!isAdmin) {
-      if (Number(newBalance) < price) return res.status(400).json({ error: "Insufficient balance" });
-      newBalance = Math.max(0, Math.round(Number(newBalance) - price));
-    }
-
-    const sold_at = nowISO();
-
-    // Mark PDF sold ONLY if still unsold and unowned
-    const { data: soldRow, error: updErr } = await supabase
-      .from(T_PDFS)
-      .update({ status: "sold", buyer_user_id: user.id, sold_at })
-      .eq("id", pdf.id)
-      .in("status", ["unsold", "UNSOLD", "Unsold"])
-      .is("buyer_user_id", null)
-      .select()
-      .maybeSingle();
-
-    if (updErr) throw updErr;
-    if (!soldRow) return res.status(409).json({ error: "PDF not available" });
-
-    // Update user balance (if needed)
-if (!isAdmin) {
-  await updateUser(user.id, { balance_cents: newBalance });
-
-  // NEW: live-update the client
-  notifyUser(user.id, "balance", { balance_cents: newBalance, reason: "purchase" });
-}
-;
-
-    // Record transaction
-    await insertTransaction({
-      id: nanoid(),
-      user_id: user.id,
-      type: "purchase",
-      pdf_id: pdf.id,
-      amount_cents: price,
-      currency: "USD",
-      status: "completed",
-      created_at: nowISO(),
-    });
-
-    const normalized = normalizePdfRow(soldRow);
-    return res.json({
-      ok: true,
-      pdf: {
-        id: normalized.id,
-        title: normalized.title,
-        state: normalized.state,
-        year: normalized.year,
-        storage_path:
-          normalized.storage_path ||
-          (normalized.file_name
-            ? SUPABASE_PREFIX
-              ? `${SUPABASE_PREFIX}/${normalized.file_name}`
-              : normalized.file_name
-            : ""),
-      },
-      new_balance_cents: isAdmin ? (user.balance_cents || 0) : newBalance,
-      supabase_synced: true,
-    });
-  } catch (e) {
-    console.error("purchase single error:", e?.message || e);
-    return res.status(500).json({ error: "Purchase failed" });
-  } finally {
-    release();
-  }
-});
-
 // Bulk purchase (best-effort; stops when balance insufficient)
 app.post("/api/purchase/bulk", requireAuth, async (req, res) => {
   // NEW: fail fast for legacy non-UUID users
@@ -865,14 +775,18 @@ app.post("/api/purchase/bulk", requireAuth, async (req, res) => {
     }
 
     if (!isAdmin) {
-  await updateUser(user.id, { balance_cents: balance });
+      await updateUser(user.id, { balance_cents: balance });
+      // NEW: live-update the client
+      notifyUser(user.id, "balance", { balance_cents: balance, reason: "bulk_purchase" });
+    }
 
-  // NEW: live-update the client
-  notifyUser(user.id, "balance", { balance_cents: balance, reason: "bulk_purchase" });
-
-    return res.json({ ok: true, purchased: purchased_ids, skipped: skipped_ids, new_balance_cents: isAdmin ? (user.balance_cents || 0) : balance });
-  } 
-    catch (e) {
+    return res.json({
+      ok: true,
+      purchased: purchased_ids,
+      skipped: skipped_ids,
+      new_balance_cents: isAdmin ? (user.balance_cents || 0) : balance
+    });
+  } catch (e) {
     console.error("Bulk purchase error:", e?.message || e);
     return res.status(500).json({ error: "Bulk purchase failed" });
   } finally {
@@ -1183,17 +1097,32 @@ app.patch("/api/admin/users/:id", requireAuth, requireAdmin, async (req, res) =>
     const patch = {};
     if (typeof name === "string") patch.name = name.trim();
     if (typeof email === "string") patch.email = email.trim();
-    if (balance_cents != null && !Number.isNaN(Number(balance_cents))) patch.balance_cents = Math.max(0, Math.round(Number(balance_cents)));
+    if (balance_cents != null && !Number.isNaN(Number(balance_cents))) {
+      patch.balance_cents = Math.max(0, Math.round(Number(balance_cents)));
+    }
     if (typeof is_admin === "boolean") patch.is_admin = is_admin;
+
+    const u = await updateUser(String(req.params.id), patch);
+
     // NEW: if admin changed balance, live-update that user
-if (patch.balance_cents != null) {
-  notifyUser(u.id, "balance", { balance_cents: u.balance_cents, reason: "admin_patch" });
-    res.json({ id: u.id, name: u.name, email: u.email, balance_cents: u.balance_cents || 0, is_admin: !!u.is_admin, created_at: u.created_at });
+    if (patch.balance_cents != null) {
+      notifyUser(u.id, "balance", { balance_cents: u.balance_cents, reason: "admin_patch" });
+    }
+
+    res.json({
+      id: u.id,
+      name: u.name,
+      email: u.email,
+      balance_cents: u.balance_cents || 0,
+      is_admin: !!u.is_admin,
+      created_at: u.created_at
+    });
   } catch (e) {
     console.error("/api/admin/users/:id patch error:", e?.message || e);
     res.status(500).json({ error: "Failed to patch user" });
   }
 });
+
 
 app.delete("/api/admin/users/:id", requireAuth, requireAdmin, async (req, res) => {
   try {
