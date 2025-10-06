@@ -737,15 +737,30 @@ app.get("/api/library", requireAuth, async (req, res) => {
 /* ------------- NOWPayments ------------- */
 app.post("/api/now/create-invoice", requireAuth, async (req, res) => {
   try {
+    // --- Validate envs up front
+    const apiKey = process.env.NOWPAY_API_KEY || "";
+    if (!apiKey) {
+      return res.status(400).json({
+        error: "NOWPayments not configured",
+        details: "NOWPAY_API_KEY is missing on the server.",
+      });
+    }
+
     const { amount_usd } = req.body || {};
     const amt = Number(amount_usd);
     if (!amt || amt < 2) return res.status(400).json({ error: "amount_usd must be >= 2" });
+
     const orderId = "dep_" + nanoid();
 
-    const baseApi = (process.env.PUBLIC_API_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
-    const baseSite = (process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
-    const ipnUrl = `${baseApi}/api/now/webhook`;
+    // Build public URLs safely; prefer env, else use the request’s public origin
+    const baseApi =
+      (process.env.PUBLIC_API_URL && process.env.PUBLIC_API_URL.replace(/\/+$/, "")) ||
+      publicBase(req); // <- fall back to actual request base (HTTPS in prod)
+    const baseSite =
+      (process.env.PUBLIC_BASE_URL && process.env.PUBLIC_BASE_URL.replace(/\/+$/, "")) ||
+      baseApi;
 
+    const ipnUrl = `${baseApi}/api/now/webhook`;
     const payload = {
       price_amount: amt,
       price_currency: "usd",
@@ -757,11 +772,22 @@ app.post("/api/now/create-invoice", requireAuth, async (req, res) => {
 
     const resp = await fetch("https://api.nowpayments.io/v1/invoice", {
       method: "POST",
-      headers: { "Content-Type": "application/json", "x-api-key": process.env.NOWPAY_API_KEY || "" },
+      headers: { "Content-Type": "application/json", "x-api-key": apiKey },
       body: JSON.stringify(payload),
     });
-    const data = await resp.json();
-    if (!resp.ok) return res.status(400).json({ error: "NOWPayments error", details: data });
+
+    const data = await resp.json().catch(() => ({}));
+
+    if (!resp.ok) {
+      // Log full error server-side for debugging
+      console.error("NOWPayments invoice error:", resp.status, data);
+      return res.status(400).json({
+        error: "NOWPayments error",
+        details: data,
+        hint:
+          "Check NOWPAY_API_KEY, enable Invoices in your NOWPayments account, and ensure PUBLIC_API_URL is an HTTPS URL reachable from the internet.",
+      });
+    }
 
     await insertTransaction({
       id: nanoid(),
@@ -779,50 +805,8 @@ app.post("/api/now/create-invoice", requireAuth, async (req, res) => {
 
     res.json({ invoice_url: data.invoice_url || data.url || null, invoice: data });
   } catch (e) {
-    console.error(e);
+    console.error("Create invoice failed:", e);
     res.status(500).json({ error: "Failed to create invoice" });
-  }
-});
-
-app.post("/api/now/webhook", express.json({ type: "*/*" }), async (req, res) => {
-  try {
-    const ipnSecret = process.env.NOWPAY_IPN_SECRET || "";
-    const signature = String(req.headers["x-nowpayments-sig"] || "");
-    const body = req.body || {};
-    const signedStr = JSON.stringify(body, Object.keys(body).sort());
-    const hmac = crypto.createHmac("sha512", ipnSecret).update(signedStr).digest("hex");
-    if (!ipnSecret || !signature || hmac !== signature) return res.status(401).json({ error: "Bad signature" });
-
-    const status = String(body.payment_status || body.invoice_status || "").toLowerCase();
-    const orderId = body.order_id || body.orderId;
-    const priceAmount = Number(body.price_amount || body.priceAmount || 0);
-    const ok = ["confirmed", "finished"].includes(status);
-
-    if (ok && orderId) {
-      const { data: txs } = await supabase
-        .from(T_TX)
-        .select("*")
-        .eq("provider_order_id", orderId)
-        .eq("type", "deposit")
-        .limit(1);
-      const tx = txs && txs[0];
-      if (tx && tx.status !== "completed") {
-        const user = await getUserById(tx.user_id);
-        if (user) {
-          const newBal = cents(user.balance_cents) + Math.round(priceAmount * 100);
-          await updateUser(user.id, { balance_cents: newBal });
-          await supabase
-            .from(T_TX)
-            .update({ status: "completed", updated_at: nowISO(), raw_last: body })
-            .eq("id", tx.id);
-          notifyUser(user.id, "balance", { balance_cents: newBal, reason: "deposit" });
-        }
-      }
-    }
-    res.json({ ok: true });
-  } catch (e) {
-    console.error(e);
-    res.json({ ok: true });
   }
 });
 
