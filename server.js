@@ -86,9 +86,12 @@ app.use(
   })
 );
 
-/* ---------- BODY PARSERS ---------- */
-app.use(express.json({ limit: "5mb" }));
-app.use(express.urlencoded({ extended: true, limit: "5mb" }));
+/* ---------- BODY PARSERS (skip NOWPayments webhook) ---------- */
+const jsonParser = express.json({ limit: "5mb" });
+const urlParser  = express.urlencoded({ extended: true, limit: "5mb" });
+app.use((req, res, next) => (req.path === "/api/now/webhook" ? next() : jsonParser(req, res, next)));
+app.use((req, res, next) => (req.path === "/api/now/webhook" ? next() : urlParser(req, res, next)));
+
 
 const PORT = process.env.PORT || 5062;
 
@@ -735,6 +738,66 @@ app.get("/api/library", requireAuth, async (req, res) => {
 });
 
 /* ------------- NOWPayments ------------- */
+// === NOWPayments IPN (RAW BODY, HMAC-verified) ===
+// Note: json/urlencoded parsers are skipped for this path (see the parser wrapper above).
+app.post("/api/now/webhook", express.raw({ type: "*/*" }), async (req, res) => {
+  try {
+    const secret = process.env.NOWPAY_IPN_SECRET || "";
+    if (!secret) return res.status(400).send("IPN secret not configured");
+
+    const sigHeader = req.get("x-nowpayments-sig") || "";
+    const sig = sigHeader.toLowerCase();
+    const raw = Buffer.isBuffer(req.body) ? req.body.toString("utf8") : String(req.body || "");
+    const calc = crypto.createHmac("sha512", secret).update(raw).digest("hex").toLowerCase();
+    if (sig !== calc) return res.status(401).send("Bad signature");
+
+    const ipn = JSON.parse(raw);
+
+    // Find the matching pending deposit created by /api/now/create-invoice
+    const { data: tx, error: txErr } = await supabase
+      .from(T_TX)
+      .select("*")
+      .or(`provider_invoice_id.eq.${ipn.invoice_id},provider_order_id.eq.${ipn.order_id}`)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (txErr || !tx) return res.status(200).send("No tx matched (ok)"); // idempotent
+
+    const s = String(ipn.payment_status || ipn.status || "").toLowerCase();
+    const finished = ["finished", "confirmed", "complete", "completed", "paid"].includes(s);
+    const failed = ["failed", "expired", "cancelled", "canceled"].includes(s);
+
+    // Persist latest webhook + status
+    await supabase
+      .from(T_TX)
+      .update({
+        status: finished ? "completed" : failed ? "failed" : "pending",
+        raw: ipn,
+        provider_tx_id: ipn.payment_id || ipn.invoice_id || null,
+        updated_at: nowISO(),
+      })
+      .eq("id", tx.id);
+
+    // Credit user on success
+    if (finished && tx.user_id) {
+      const u = await getUserById(tx.user_id);
+      if (u) {
+        const newBal = Math.max(0, Math.round((u.balance_cents || 0) + (tx.amount_cents || 0)));
+        await updateUser(u.id, { balance_cents: newBal });
+        // Push live balance event via SSE
+        notifyUser(u.id, "balance", { balance_cents: newBal, reason: "deposit" });
+      }
+    }
+
+    return res.status(200).send("ok");
+  } catch (e) {
+    console.error("/api/now/webhook error:", e?.message || e);
+    // Keep IPN idempotent / non-retrying even on error
+    return res.status(200).send("ok");
+  }
+});
+
 app.post("/api/now/create-invoice", requireAuth, async (req, res) => {
   try {
     // --- Validate envs up front
