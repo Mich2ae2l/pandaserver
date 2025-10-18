@@ -457,6 +457,13 @@ const sseSend = (res, event, data) => {
 const ssePing = (res) => {
   res.write(`: ping\n\n`);
 };
+// ---- Presence (online users) ----
+const onlineUsers = new Set(); // user_ids with an open /api/chat/stream
+
+function broadcastPresence() {
+  const payload = { online: Array.from(onlineUsers) };
+  for (const r of adminStreams) sseSend(r, "presence", payload);
+}
 
 async function pushMessage({ user_id, from, text }) {
   const msg = await chatInsert({ user_id, from, text: String(text || "").slice(0, MAX_TEXT) });
@@ -1909,8 +1916,14 @@ app.get("/api/chat/stream", requireAuth, (req, res) => {
   });
   sseSend(res, "hello", { ok: true, user_id: req.user.id });
   const uid = req.user.id;
+
+  // NEW: mark user online and tell admins
+  onlineUsers.add(uid);
+  broadcastPresence();
+
   if (!userStreams.has(uid)) userStreams.set(uid, new Set());
   userStreams.get(uid).add(res);
+
   const keepAlive = setInterval(() => ssePing(res), 15000);
   req.on("close", () => {
     clearInterval(keepAlive);
@@ -1919,8 +1932,13 @@ app.get("/api/chat/stream", requireAuth, (req, res) => {
       set.delete(res);
       if (set.size === 0) userStreams.delete(uid);
     }
+
+    // NEW: mark user offline and tell admins
+    onlineUsers.delete(uid);
+    broadcastPresence();
   });
 });
+
 app.get("/api/admin/chat/:userId/history", requireAuth, requireAdmin, async (req, res) => {
   try {
     const userId = String(req.params.userId);
@@ -1953,6 +1971,111 @@ app.get("/api/admin/chat/stream", requireAuth, requireAdmin, (req, res) => {
     Connection: "keep-alive",
   });
   sseSend(res, "hello", { ok: true, admin: true });
+
+  // NEW: push current presence immediately
+  sseSend(res, "presence", { online: Array.from(onlineUsers) });
+// === Admin: Chat overview per user (last msg + unread_count + totals)
+app.get("/api/admin/chat/overview", requireAuth, requireAdmin, async (_req, res) => {
+  try {
+    // recent slice of messages
+    const { data: msgs } = await supabase
+      .from(T_CHATS)
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(5000);
+
+    // user basics (may or may not have the optional columns)
+    const { data: users } = await supabase.from(T_USERS).select("*");
+
+    const byUser = new Map();
+    for (const m of msgs || []) {
+      const u = byUser.get(m.user_id) || { last: null, total: 0, fromUserAfter: [] };
+      if (!u.last) u.last = m; // first seen in DESC => latest
+      u.total++;
+      if (m.from === "user") u.fromUserAfter.push(m);
+      byUser.set(m.user_id, u);
+    }
+
+    const items = (users || []).map((u) => {
+      const bucket = byUser.get(u.id) || { last: null, total: 0, fromUserAfter: [] };
+      const last = bucket.last;
+      const last_from = last ? last.from : null;
+      const last_text = last ? last.text : "";
+      const last_at = last ? last.created_at : null;
+
+      // unread for ADMIN: user->admin msgs after admin last saw
+      let unread_count = 0;
+      const seenISO = u.last_chat_seen_admin_at ? Date.parse(u.last_chat_seen_admin_at) : null;
+      if (seenISO && seenISO > 0) {
+        unread_count = bucket.fromUserAfter.filter((m) => Date.parse(m.created_at) > seenISO).length;
+      } else {
+        // optional column missing => stay quiet (0)
+        unread_count = 0;
+      }
+
+      return {
+        user_id: u.id,
+        name: u.name ?? null,
+        email: u.email ?? null,
+        is_admin: !!u.is_admin,
+        last_from,
+        last_text,
+        last_at,
+        unread_count,
+        total_msgs: bucket.total,
+      };
+    });
+
+    // sort: unread first, then most recent
+    items.sort((a, b) => {
+      if (b.unread_count !== a.unread_count) return b.unread_count - a.unread_count;
+      const atA = a.last_at ? Date.parse(a.last_at) : 0;
+      const atB = b.last_at ? Date.parse(b.last_at) : 0;
+      return atB - atA;
+    });
+
+    res.json({ items });
+  } catch (e) {
+    console.error("/api/admin/chat/overview error:", e?.message || e);
+    res.json({ items: [] }); // don't break UI
+  }
+});
+
+// === Admin marks a user's conversation as read (optional column; ignore failure)
+app.post("/api/admin/chat/:userId/read", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const userId = String(req.params.userId);
+    try {
+      await updateUser(userId, { last_chat_seen_admin_at: nowISO() });
+    } catch (e) {
+      // Column might not exist — it's fine
+      console.warn("admin read marker (optional):", e?.message || e);
+    }
+    res.json({ ok: true });
+  } catch {
+    res.json({ ok: true });
+  }
+});
+
+// === User marks their own chat as read (optional column; ignore failure)
+app.post("/api/chat/read", requireAuth, async (req, res) => {
+  try {
+    try {
+      await updateUser(req.user.id, { last_chat_seen_user_at: nowISO() });
+    } catch (e) {
+      console.warn("user read marker (optional):", e?.message || e);
+    }
+    res.json({ ok: true });
+  } catch {
+    res.json({ ok: true });
+  }
+});
+
+// === Admin can fetch current presence snapshot (helper)
+app.get("/api/admin/online-users", requireAuth, requireAdmin, (_req, res) => {
+  res.json({ online: Array.from(onlineUsers) });
+});
+
   adminStreams.add(res);
   const keepAlive = setInterval(() => ssePing(res), 15000);
   req.on("close", () => {
@@ -1960,6 +2083,7 @@ app.get("/api/admin/chat/stream", requireAuth, requireAdmin, (req, res) => {
     adminStreams.delete(res);
   });
 });
+
 
 /* ------------- Health & bootstrap ------------- */
 app.get("/api/health", (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
