@@ -759,11 +759,16 @@ app.post("/api/now/webhook", express.raw({ type: "*/*" }), async (req, res) => {
     if (sig !== calc) return res.status(401).send("Bad signature");
 
     const ipn = JSON.parse(raw);
+    const s = String(ipn.payment_status || ipn.status || "").toLowerCase();
+    const finished = ["finished", "confirmed", "complete", "completed", "paid"].includes(s);
+    const failed   = ["failed", "expired", "cancelled", "canceled"].includes(s);
+    const newStatus = finished ? "completed" : failed ? "failed" : "pending";
 
-    // Find the matching pending deposit created by /api/now/create-invoice
+    // 1) Find the matching deposit transaction
     const { data: tx, error: txErr } = await supabase
       .from(T_TX)
       .select("*")
+      .eq("type", "deposit")
       .or(`provider_invoice_id.eq.${ipn.invoice_id},provider_order_id.eq.${ipn.order_id}`)
       .order("created_at", { ascending: false })
       .limit(1)
@@ -771,28 +776,41 @@ app.post("/api/now/webhook", express.raw({ type: "*/*" }), async (req, res) => {
 
     if (txErr || !tx) return res.status(200).send("No tx matched (ok)"); // idempotent
 
-    const s = String(ipn.payment_status || ipn.status || "").toLowerCase();
-    const finished = ["finished", "confirmed", "complete", "completed", "paid"].includes(s);
-    const failed = ["failed", "expired", "cancelled", "canceled"].includes(s);
+    // 2) If already non-pending (completed/failed), just record latest webhook payload for auditing — no credit.
+    if (String(tx.status).toLowerCase() !== "pending") {
+      await supabase
+        .from(T_TX)
+        .update({
+          raw: ipn,
+          provider_tx_id: ipn.payment_id || ipn.invoice_id || null,
+          updated_at: nowISO(),
+        })
+        .eq("id", tx.id);
+      return res.status(200).send("ok");
+    }
 
-    // Persist latest webhook + status
-    await supabase
+    // 3) Atomically flip PENDING -> newStatus, only if still pending at write time.
+    const { data: updated, error: updErr } = await supabase
       .from(T_TX)
       .update({
-        status: finished ? "completed" : failed ? "failed" : "pending",
+        status: newStatus,
         raw: ipn,
         provider_tx_id: ipn.payment_id || ipn.invoice_id || null,
         updated_at: nowISO(),
       })
-      .eq("id", tx.id);
+      .eq("id", tx.id)
+      .eq("status", "pending") // <-- critical guard preventing double-credit
+      .select()
+      .maybeSingle();
 
-    // Credit user on success
-    if (finished && tx.user_id) {
+    if (updErr) throw updErr;
+
+    // 4) Credit ONCE: only when we just transitioned from pending to completed.
+    if (updated && newStatus === "completed" && tx.user_id) {
       const u = await getUserById(tx.user_id);
       if (u) {
         const newBal = Math.max(0, Math.round((u.balance_cents || 0) + (tx.amount_cents || 0)));
         await updateUser(u.id, { balance_cents: newBal });
-        // Push live balance event via SSE
         notifyUser(u.id, "balance", { balance_cents: newBal, reason: "deposit" });
       }
     }
@@ -800,7 +818,7 @@ app.post("/api/now/webhook", express.raw({ type: "*/*" }), async (req, res) => {
     return res.status(200).send("ok");
   } catch (e) {
     console.error("/api/now/webhook error:", e?.message || e);
-    // Keep IPN idempotent / non-retrying even on error
+    // keep IPN idempotent/non-retrying even on error
     return res.status(200).send("ok");
   }
 });
