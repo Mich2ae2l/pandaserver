@@ -2114,76 +2114,85 @@ if (fs.existsSync(clientIndex)) {
     res.status(200).send("Frontend is hosted separately. Visit the Netlify site.")
   );
 }
-/* ============ SHEETS INSPECT (no SA fallback) ============ */
+/* ============ SHEETS INSPECT (robust) ============ */
 app.post("/api/admin/sheets/inspect", requireAuth, requireAdmin, async (req, res) => {
   try {
     const rawUrl = String(req.body?.url || "").trim();
     if (!rawUrl) return res.status(400).json({ error: "url required" });
 
-    // If you *do* add SA later, branch here:
+    // If you later add Google SA, branch here.
     if (process.env.GOOGLE_SA_EMAIL && process.env.GOOGLE_SA_PRIVATE_KEY) {
       return res.status(400).json({
         error: "Service Account mode not implemented in this snippet",
-        hint: "You can keep this fallback, or wire SA with official Google API client."
+        hint: "Wire the official Google API client if you need private sheets."
       });
     }
 
-    // ---- Public CSV fallback ----
-    // Accepts either:
-    //  - normal edit URL: https://docs.google.com/spreadsheets/d/{id}/edit#gid={gid}
-    //  - or direct csv:   https://docs.google.com/spreadsheets/d/{id}/export?format=csv&gid={gid}
-    const idMatch = rawUrl.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
-    if (!idMatch) return res.status(400).json({ error: "Could not find spreadsheetId in URL" });
-    const spreadsheetId = idMatch[1];
-
-    // extract gid if present; default to 0
-    let gid = "0";
-    const gidHash = rawUrl.match(/[?#]gid=(\d+)/);
-    if (gidHash) gid = gidHash[1];
-
-    // build a csv export url
     let csvUrl = rawUrl;
-    if (!/\/export\?/.test(rawUrl)) {
+    let gid = "0";
+
+    // 1) Already an "export?format=csv" URL: use as-is, just ensure gid
+    if (/\/spreadsheets\/d\/[^/]+\/export\?/i.test(rawUrl)) {
+      const u = new URL(rawUrl);
+      gid = u.searchParams.get("gid") || "0";
+      if (!u.searchParams.get("format")) u.searchParams.set("format", "csv");
+      csvUrl = u.toString();
+    }
+    // 2) Publish-to-web: /spreadsheets/d/e/<KEY>/pub?... -> keep, force output=csv & gid
+    else if (/\/spreadsheets\/d\/e\/[A-Za-z0-9-_]+\/pub/i.test(rawUrl)) {
+      const u = new URL(rawUrl);
+      gid = u.searchParams.get("gid") || "0";
+      // Some publish links use ?output=csv, others need single=true
+      if (!u.searchParams.get("output")) u.searchParams.set("output", "csv");
+      if (!u.searchParams.get("single")) u.searchParams.set("single", "true");
+      u.searchParams.set("gid", gid);
+      csvUrl = u.toString();
+    }
+    // 3) Normal edit URL: /spreadsheets/d/<ID>/edit#gid=<gid> -> rewrite to export
+    else {
+      const idMatch = rawUrl.match(/\/spreadsheets\/d\/([A-Za-z0-9-_]+)/i);
+      if (!idMatch) {
+        return res.status(400).json({ error: "Could not find spreadsheetId in URL" });
+      }
+      const spreadsheetId = idMatch[1];
+      const mGid = rawUrl.match(/[?#]gid=(\d+)/);
+      gid = mGid ? mGid[1] : "0";
       csvUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=csv&gid=${gid}`;
     }
 
-    // fetch csv (must be published or link-shared "anyone")
+    // Fetch CSV (must be public to "Anyone with the link" or Published)
     const r = await fetch(csvUrl);
     if (!r.ok) {
       return res.status(r.status).json({
         error: `Google returned ${r.status} (${r.statusText})`,
-        hint:
-          "If this is private, either publish the tab to the web or switch to OAuth/Service Account."
+        hint: "Make the tab public (link-shared) or published, or move to OAuth/SA."
       });
     }
     const text = await r.text();
 
-    // basic parse: first line -> headers (split by comma; very simple CSV)
-    const lines = text.split(/\r?\n/).filter((ln) => ln.length > 0);
-    const first = lines[0] || "";
-    const headers = first.split(",").map((h) => h.replace(/^"|"$/g, "").trim()).filter(Boolean);
-    const estimatedRows = Math.max(0, lines.length - 1); // minus header row
-
-    // We don't have metadata (title/tab name) without auth; use fallbacks
-    const spreadsheetTitle = "Published Sheet";
-    const tabTitle = `gid:${gid}`;
+    // Parse header row (simple CSV split – works for plain headers)
+    const lines = text.split(/\r?\n/).filter(Boolean);
+    const headers = (lines[0] || "")
+      .split(",")
+      .map(h => h.replace(/^"|"$/g, "").trim())
+      .filter(Boolean);
 
     return res.json({
-      spreadsheetId,
-      spreadsheetTitle,
+      spreadsheetTitle: "Google Sheet",
       sheets: [
         {
-          title: tabTitle,
-          estimatedRows,
-          headers: headers.slice(0, 100) // keep it bounded
+          title: `gid:${gid}`,
+          estimatedRows: Math.max(0, lines.length - 1),
+          headers: headers.slice(0, 100),
         }
       ]
     });
   } catch (e) {
-    console.error("/api/admin/sheets/inspect fallback error:", e?.message || e);
+    console.error("/api/admin/sheets/inspect error:", e?.message || e);
     return res.status(500).json({ error: "Inspect failed" });
   }
 });
+
 /* ============ PREMIUM ITEMS (Admin) ============ */
 
 // List premium items
