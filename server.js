@@ -2235,7 +2235,7 @@ app.get("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res) 
 // Create/save premium item
 app.post("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res) => {
   try {
-    const {
+    let {
       title,
       subtitle = "",
       tags = "",
@@ -2250,11 +2250,29 @@ app.post("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res)
       rows_estimate = 0,
     } = req.body || {};
 
+    // Backfill csv_url_public from sheet_url_admin + gid when missing
+    if (!csv_url_public && sheet_url_admin) {
+      const m = sheet_url_admin.match(/\/spreadsheets\/d\/([A-Za-z0-9-_]+)/i);
+      if (m) {
+        const id = m[1];
+        const g = (sheet_url_admin.match(/[?#]gid=(\d+)/) || [,"0"])[1];
+        gid = gid || g;
+        csv_url_public = `https://docs.google.com/spreadsheets/d/${id}/export?format=csv&gid=${gid}`;
+        spreadsheet_id = spreadsheet_id || id;
+      } else if (/\/spreadsheets\/d\/e\/[A-Za-z0-9-_]+\/pub/i.test(sheet_url_admin)) {
+        const u2 = new URL(sheet_url_admin);
+        if (!u2.searchParams.get("output")) u2.searchParams.set("output","csv");
+        if (!u2.searchParams.get("single")) u2.searchParams.set("single","true");
+        if (!u2.searchParams.get("gid"))    u2.searchParams.set("gid", gid || "0");
+        csv_url_public = u2.toString();
+        spreadsheet_id = spreadsheet_id || (sheet_url_admin.match(/\/spreadsheets\/d\/e\/([A-Za-z0-9-_]+)/)?.[1] || "");
+      }
+    }
+
     if (!title || !csv_url_public) {
       return res.status(400).json({ error: "title and csv_url_public are required" });
     }
 
-    // quick sanity: must be a docs.google.com export/publish url
     if (!/^https:\/\/docs\.google\.com\/spreadsheets\/.+/.test(String(csv_url_public))) {
       return res.status(400).json({ error: "csv_url_public must be a Google Sheets CSV URL" });
     }
@@ -2283,6 +2301,7 @@ app.post("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res)
     res.status(500).json({ error: "Failed to save premium item" });
   }
 });
+
 
 // Optional: patch & delete
 app.patch("/api/admin/premium/items/:id", requireAuth, requireAdmin, async (req, res) => {
