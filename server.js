@@ -2114,6 +2114,7 @@ if (fs.existsSync(clientIndex)) {
     res.status(200).send("Frontend is hosted separately. Visit the Netlify site.")
   );
 }
+
 /* ============ SHEETS INSPECT (robust) ============ */
 app.post("/api/admin/sheets/inspect", requireAuth, requireAdmin, async (req, res) => {
   try {
@@ -2232,37 +2233,151 @@ app.get("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res) 
   }
 });
 /* ======== PUBLIC PREMIUM LIST ======== */
+// REPLACE your current: app.get("/api/premium/items", ...)
 app.get("/api/premium/items", async (req, res) => {
   try {
+    // service: "sheets" | "documents"
     const svc = String(req.query.service || "sheets").toLowerCase();
+    const page = Math.max(Number(req.query.page) || 1, 1);
+    const per_page = Math.min(Math.max(Number(req.query.per_page) || 30, 1), 200);
 
-    const { data, error } = await supabase
+    // allow both "documents" and "docs"
+    const serviceFilter = svc === "documents" ? ["documents", "docs"] : [svc];
+
+    // basic query
+    const from = (page - 1) * per_page;
+    const to = from + per_page - 1;
+
+    const { data, count, error } = await supabase
       .from("premium_items")
-      .select("*")
-      .eq("service", svc)
+      .select("*", { count: "exact" })
+      .in("service", serviceFilter)
       .eq("listed", true)
-      .order("created_at", { ascending: false });
+      .order("created_at", { ascending: false })
+      .range(from, to);
 
     if (error) throw error;
 
-    const items = (data || []).map(r => ({
+    const items = (data || []).map((r) => ({
       id: r.id,
-      service: r.service,
+      service: r.service || "sheets",
       title: r.title,
       subtitle: r.subtitle || "",
-      tags: (r.tags || "").split(/[|,]/).map(s => s.trim()).filter(Boolean),
-      rows_estimate: r.rows_estimate || 0,
-      price_cents: r.price_cents || 0,
-      csv_url_public: r.csv_url_public || null,   // OK to expose if link-shared/published
-      created_at: r.created_at,
+      price_cents: Number(r.price_cents || 0),
+      label: r.label || null,
+      listed: !!r.listed,
+      owned: false, // set true after purchase API if you track ownership
+      meta: {
+        tags: (r.tags || "")
+          .split(/[|,]/)
+          .map((s) => s.trim())
+          .filter(Boolean),
+        rows: Number(r.rows_estimate || 0),
+        updated_at: r.updated_at || r.created_at || null,
+        sample_headers: Array.isArray(r.headers) ? r.headers : [],
+        // optional guidance fields used by the offer UI:
+        min_chunk_rows: Number(r.min_rows || 0) || undefined,
+        price_per_1000_cents: Number(r.price_per_1k_cents || r.price_per_1000_cents || 0) || undefined,
+        offer_suggestions: Array.isArray(r.offer_suggestions) ? r.offer_suggestions.slice(0, 5) : [],
+      },
     }));
 
-    res.json({ items });
+    res.json({
+      items,
+      total: count ?? items.length,
+      page,
+      per_page,
+    });
   } catch (e) {
     console.error("/api/premium/items public list error:", e?.message || e);
     res.status(500).json({ error: "Failed to list premium items" });
   }
 });
+// NEW: purchase a premium item
+app.post("/api/premium/purchase", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.body || {};
+    if (!id) return res.status(400).json({ error: "id required" });
+
+    // fetch item
+    const { data: item, error } = await supabase
+      .from("premium_items")
+      .select("*")
+      .eq("id", id)
+      .maybeSingle();
+    if (error) throw error;
+    if (!item || !item.listed) return res.status(404).json({ error: "Not found" });
+
+    const price = Number(item.price_cents || 0);
+    const user = await getUserById(req.user.id);
+    if (!user) return res.status(401).json({ error: "User not found" });
+
+    if ((user.balance_cents || 0) < price) {
+      return res.status(400).json({ error: "Insufficient balance" });
+    }
+
+    // debit balance
+    const newBal = Math.max(0, Math.round((user.balance_cents || 0) - price));
+    await updateUser(user.id, { balance_cents: newBal });
+
+    // record transaction
+    await insertTransaction({
+      id: nanoid(),
+      user_id: user.id,
+      type: "purchase",
+      premium_item_id: item.id,
+      amount_cents: price,
+      currency: "USD",
+      status: "completed",
+      created_at: nowISO(),
+    });
+
+    // Optionally mark entitlement table; for now return ok
+    notifyUser(user.id, "balance", { balance_cents: newBal, reason: "premium_purchase" });
+
+    res.json({ ok: true, new_balance_cents: newBal });
+  } catch (e) {
+    console.error("/api/premium/purchase error:", e?.message || e);
+    res.status(500).json({ error: "Purchase failed" });
+  }
+});
+
+// NEW: gated download link for a premium item
+// replace the body of /api/premium/items/:id/download
+app.get("/api/premium/items/:id/download", requireAuth, async (req, res) => {
+  try {
+    const id = String(req.params.id);
+
+    const { data: item, error } = await supabase
+      .from("premium_items")
+      .select("*")
+      .eq("id", id)
+      .maybeSingle();
+    if (error) throw error;
+    if (!item) return res.status(404).json({ error: "Not found" });
+
+    // authorize: has user purchased this premium item?
+    const { data: tx, error: txErr } = await supabase
+      .from(T_TX)
+      .select("id")
+      .eq("user_id", req.user.id)
+      .eq("type", "purchase")
+      .eq("premium_item_id", id)
+      .eq("status", "completed")
+      .limit(1)
+      .maybeSingle();
+    if (txErr) throw txErr;
+    if (!tx && !req.user.is_admin) return res.status(403).json({ error: "Purchase required" });
+
+    if (item.csv_url_public) return res.redirect(302, item.csv_url_public);
+    return res.status(400).json({ error: "No delivery URL configured" });
+  } catch (e) {
+    console.error("/api/premium/items/:id/download error:", e?.message || e);
+    res.status(500).json({ error: "Download failed" });
+  }
+});
+
+
 app.get("/api/premium/stats", async (_req, res) => {
   try {
     const services = ["sheets", "docs", "custom"];
@@ -2350,7 +2465,7 @@ app.post("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res)
       gid: String(gid || "0"),
       sheet_url_admin: String(sheet_url_admin || ""),
       csv_url_public: String(csv_url_public),
-
+     tags: String(tags || "").trim(), 
       headers: Array.isArray(headers) ? headers.slice(0, 200) : [],
       rows_estimate: Math.max(0, Number(rows_estimate || 0)),
 
