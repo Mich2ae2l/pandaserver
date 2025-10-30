@@ -2231,8 +2231,7 @@ app.get("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res) 
     res.status(500).json({ error: "Failed to list premium items" });
   }
 });
-
-// Create/save premium item
+// Create/save premium item (fixed to match DB columns)
 app.post("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res) => {
   try {
     let {
@@ -2241,11 +2240,11 @@ app.post("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res)
       tags = "",
       listed = false,
       min_rows = 1000,
-      price_per_1k_cents = 500,
+      price_per_1k_cents = 500,     // UI name; we map it to price_cents
       spreadsheet_id = "",
       gid = "0",
       sheet_url_admin = "",
-      delivery_url = "", // <— NEW: support UI field
+      delivery_url = "",            // admin-only link, optional
       csv_url_public,
       headers = [],
       rows_estimate = 0,
@@ -2279,21 +2278,34 @@ app.post("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res)
       return res.status(400).json({ error: "title and csv_url_public are required" });
     }
 
- 
+    // *** IMPORTANT: match your table columns ***
+    // - service is NOT NULL in your DB -> set it explicitly
+    // - your table uses price_cents (not price_per_1k_cents)
     const row = {
       title: String(title).trim(),
       subtitle: String(subtitle || "").trim(),
-      tags: String(tags || "").trim(),
       listed: !!listed,
+
+      service: "google_sheets",                 // <— REQUIRED to satisfy NOT NULL
+      delivery_type: "gated",                   // ok if this column exists (else remove)
+      delivery_url: String(delivery_url || ""), // ok if this column exists (else remove)
+
       min_rows: Math.max(1, Number(min_rows || 1)),
-      price_per_1k_cents: Math.max(0, Number(price_per_1k_cents || 0)),
+      price_cents: Math.max(0, Number(price_per_1k_cents || 0)), // <— map UI -> DB
+
       spreadsheet_id: String(spreadsheet_id || ""),
       gid: String(gid || "0"),
       sheet_url_admin: String(sheet_url_admin || ""),
       csv_url_public: String(csv_url_public),
+
       headers: Array.isArray(headers) ? headers.slice(0, 200) : [],
       rows_estimate: Math.max(0, Number(rows_estimate || 0)),
+
+      // put “optional/extras” somewhere safe if you have a meta column; otherwise ignore
+      // meta: { tags: String(tags || "").trim() },
+
       created_at: nowISO(),
+      updated_at: nowISO(),
     };
 
     const { data, error } = await supabase.from("premium_items").insert(row).select().single();
@@ -2304,6 +2316,7 @@ app.post("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res)
     res.status(500).json({ error: "Failed to save premium item" });
   }
 });
+
 
 
 // Optional: patch & delete
