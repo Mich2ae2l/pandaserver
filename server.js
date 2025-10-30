@@ -2512,28 +2512,68 @@ app.post("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res)
 
 
 // Optional: patch & delete
+// Recompute price_cents on edit when price_per_1k_cents or rows_estimate change
 app.patch("/api/admin/premium/items/:id", requireAuth, requireAdmin, async (req, res) => {
   try {
     const id = String(req.params.id);
-    const patch = req.body || {};
-    const { data, error } = await supabase.from("premium_items").update(patch).eq("id", id).select().single();
+
+    // 1) Load current row so we can merge safely
+    const { data: current, error: getErr } = await supabase
+      .from("premium_items")
+      .select("*")
+      .eq("id", id)
+      .maybeSingle();
+    if (getErr) throw getErr;
+    if (!current) return res.status(404).json({ error: "Not found" });
+
+    // 2) Normalize incoming fields
+    const patch = { ...req.body };
+
+    // ensure numeric fields are numbers (or undefined)
+    const incomingPer1k = patch.price_per_1k_cents != null ? Number(patch.price_per_1k_cents) : undefined;
+    const incomingRows  = patch.rows_estimate      != null ? Number(patch.rows_estimate)      : undefined;
+    const incomingMin   = patch.min_rows           != null ? Number(patch.min_rows)           : undefined;
+    const incomingTotal = patch.price_cents        != null ? Number(patch.price_cents)        : undefined;
+
+    if (incomingPer1k != null && !Number.isFinite(incomingPer1k)) delete patch.price_per_1k_cents;
+    if (incomingRows  != null && !Number.isFinite(incomingRows))  delete patch.rows_estimate;
+    if (incomingMin   != null && !Number.isFinite(incomingMin))   delete patch.min_rows;
+    if (incomingTotal != null && !Number.isFinite(incomingTotal)) delete patch.price_cents;
+
+    // 3) Determine the numbers we’ll use to compute the total
+    const per1k = (incomingPer1k != null ? incomingPer1k : Number(current.price_per_1k_cents || 0));
+    const rows  = (incomingRows  != null ? incomingRows  : Number(current.rows_estimate || 0));
+
+    // 4) If caller DIDN’T pass price_cents explicitly, recompute from rows × per-1k
+    //    (round to nearest cent)
+    if (incomingTotal == null) {
+      const computed = Math.max(0, Math.round((rows / 1000) * per1k));
+      patch.price_cents = computed;
+    } else {
+      // caller wants a fully custom total; clamp at 0
+      patch.price_cents = Math.max(0, Math.round(incomingTotal));
+    }
+
+    // keep the guide and other fields consistent
+    if (incomingPer1k != null) patch.price_per_1k_cents = Math.max(0, Math.round(per1k));
+    if (incomingRows  != null) patch.rows_estimate      = Math.max(0, Math.round(rows));
+    if (incomingMin   != null) patch.min_rows           = Math.max(1, Math.round(incomingMin));
+
+    patch.updated_at = new Date().toISOString();
+
+    // 5) Write back
+    const { data, error } = await supabase
+      .from("premium_items")
+      .update(patch)
+      .eq("id", id)
+      .select()
+      .single();
     if (error) throw error;
-    res.json({ ok: true, item: data });
+
+    return res.json({ ok: true, item: data });
   } catch (e) {
     console.error("/api/admin/premium/items/:id PATCH error:", e?.message || e);
     res.status(500).json({ error: "Failed to update premium item" });
-  }
-});
-
-app.delete("/api/admin/premium/items/:id", requireAuth, requireAdmin, async (req, res) => {
-  try {
-    const id = String(req.params.id);
-    const { error } = await supabase.from("premium_items").delete().eq("id", id);
-    if (error) throw error;
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("/api/admin/premium/items/:id DELETE error:", e?.message || e);
-    res.status(500).json({ error: "Failed to delete premium item" });
   }
 });
 
