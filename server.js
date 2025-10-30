@@ -2231,6 +2231,58 @@ app.get("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res) 
     res.status(500).json({ error: "Failed to list premium items" });
   }
 });
+/* ======== PUBLIC PREMIUM LIST ======== */
+app.get("/api/premium/items", async (req, res) => {
+  try {
+    const svc = String(req.query.service || "sheets").toLowerCase();
+
+    const { data, error } = await supabase
+      .from("premium_items")
+      .select("*")
+      .eq("service", svc)
+      .eq("listed", true)
+      .order("created_at", { ascending: false });
+
+    if (error) throw error;
+
+    const items = (data || []).map(r => ({
+      id: r.id,
+      service: r.service,
+      title: r.title,
+      subtitle: r.subtitle || "",
+      tags: (r.tags || "").split(/[|,]/).map(s => s.trim()).filter(Boolean),
+      rows_estimate: r.rows_estimate || 0,
+      price_cents: r.price_cents || 0,
+      csv_url_public: r.csv_url_public || null,   // OK to expose if link-shared/published
+      created_at: r.created_at,
+    }));
+
+    res.json({ items });
+  } catch (e) {
+    console.error("/api/premium/items public list error:", e?.message || e);
+    res.status(500).json({ error: "Failed to list premium items" });
+  }
+});
+app.get("/api/premium/stats", async (_req, res) => {
+  try {
+    const services = ["sheets", "docs", "custom"];
+    const out = {};
+    for (const s of services) {
+      const { count, error } = await supabase
+        .from("premium_items")
+        .select("id", { count: "exact" })
+        .eq("service", s)
+        .eq("listed", true);
+      if (error) throw error;
+      out[s] = count || 0;
+    }
+    res.json(out);
+  } catch (e) {
+    console.error("/api/premium/stats error:", e?.message || e);
+    res.json({ sheets: 0, docs: 0, custom: 0 });
+  }
+});
+
 // Create/save premium item (fixed to match DB columns)
 app.post("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res) => {
   try {
@@ -2286,7 +2338,8 @@ app.post("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res)
       subtitle: String(subtitle || "").trim(),
       listed: !!listed,
 
-      service: "google_sheets",                 // <— REQUIRED to satisfy NOT NULL
+     service: "sheets",
+              // <— REQUIRED to satisfy NOT NULL
       delivery_type: "gated",                   // ok if this column exists (else remove)
       delivery_url: String(delivery_url || ""), // ok if this column exists (else remove)
 
