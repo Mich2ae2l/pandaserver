@@ -49,6 +49,7 @@ const __dirname = path.dirname(__filename);
 dotenv.config();
 const app = express();
 
+
 app.set("trust proxy", true);
 
 /* ---------- CORS FIRST ---------- */
@@ -556,6 +557,7 @@ app.get("/api/me", requireAuth, async (req, res) => {
     res.status(500).json({ error: "Failed to fetch user" });
   }
 });
+
 
 /* -------- Password reset -------- */
 /** Public "forgot password" — disabled by default (ALLOW_PUBLIC_FORGOT=false). */
@@ -2096,6 +2098,7 @@ app.get("/api/admin/online-users", requireAuth, requireAdmin, (_req, res) => {
   res.json({ online: Array.from(onlineUsers) });
 });
 
+
 /* ------------- Health & bootstrap ------------- */
 app.get("/api/health", (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 app.get("/", (_req, res) => res.json({ ok: true, app: "Panda PDF API", try: "/api/health" }));
@@ -2111,6 +2114,77 @@ if (fs.existsSync(clientIndex)) {
     res.status(200).send("Frontend is hosted separately. Visit the Netlify site.")
   );
 }
+/* ============ SHEETS INSPECT (no SA fallback) ============ */
+app.post("/api/admin/sheets/inspect", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const rawUrl = String(req.body?.url || "").trim();
+    if (!rawUrl) return res.status(400).json({ error: "url required" });
+
+    // If you *do* add SA later, branch here:
+    if (process.env.GOOGLE_SA_EMAIL && process.env.GOOGLE_SA_PRIVATE_KEY) {
+      return res.status(400).json({
+        error: "Service Account mode not implemented in this snippet",
+        hint: "You can keep this fallback, or wire SA with official Google API client."
+      });
+    }
+
+    // ---- Public CSV fallback ----
+    // Accepts either:
+    //  - normal edit URL: https://docs.google.com/spreadsheets/d/{id}/edit#gid={gid}
+    //  - or direct csv:   https://docs.google.com/spreadsheets/d/{id}/export?format=csv&gid={gid}
+    const idMatch = rawUrl.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+    if (!idMatch) return res.status(400).json({ error: "Could not find spreadsheetId in URL" });
+    const spreadsheetId = idMatch[1];
+
+    // extract gid if present; default to 0
+    let gid = "0";
+    const gidHash = rawUrl.match(/[?#]gid=(\d+)/);
+    if (gidHash) gid = gidHash[1];
+
+    // build a csv export url
+    let csvUrl = rawUrl;
+    if (!/\/export\?/.test(rawUrl)) {
+      csvUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=csv&gid=${gid}`;
+    }
+
+    // fetch csv (must be published or link-shared "anyone")
+    const r = await fetch(csvUrl);
+    if (!r.ok) {
+      return res.status(r.status).json({
+        error: `Google returned ${r.status} (${r.statusText})`,
+        hint:
+          "If this is private, either publish the tab to the web or switch to OAuth/Service Account."
+      });
+    }
+    const text = await r.text();
+
+    // basic parse: first line -> headers (split by comma; very simple CSV)
+    const lines = text.split(/\r?\n/).filter((ln) => ln.length > 0);
+    const first = lines[0] || "";
+    const headers = first.split(",").map((h) => h.replace(/^"|"$/g, "").trim()).filter(Boolean);
+    const estimatedRows = Math.max(0, lines.length - 1); // minus header row
+
+    // We don't have metadata (title/tab name) without auth; use fallbacks
+    const spreadsheetTitle = "Published Sheet";
+    const tabTitle = `gid:${gid}`;
+
+    return res.json({
+      spreadsheetId,
+      spreadsheetTitle,
+      sheets: [
+        {
+          title: tabTitle,
+          estimatedRows,
+          headers: headers.slice(0, 100) // keep it bounded
+        }
+      ]
+    });
+  } catch (e) {
+    console.error("/api/admin/sheets/inspect fallback error:", e?.message || e);
+    return res.status(500).json({ error: "Inspect failed" });
+  }
+});
+
 
 /* ------------ FINAL: /api catch-all 404 ------------ */
 app.use("/api", (req, res) => res.status(404).json({ error: "Not found", path: req.originalUrl }));
