@@ -2114,113 +2114,190 @@ if (fs.existsSync(clientIndex)) {
     res.status(200).send("Frontend is hosted separately. Visit the Netlify site.")
   );
 }
-/* ============ SHEETS INSPECT (always 200 on functional errors) ============ */
+/* ============ SHEETS INSPECT (no SA fallback) ============ */
 app.post("/api/admin/sheets/inspect", requireAuth, requireAdmin, async (req, res) => {
   try {
-    // DEBUG: confirm we have a user + admin
-    if (!req.user?.id) {
-      return res.status(401).json({ ok: false, error: "Missing user on request" });
-    }
-
     const rawUrl = String(req.body?.url || "").trim();
-    if (!rawUrl) return res.status(200).json({ ok: false, error: "url required" });
+    if (!rawUrl) return res.status(400).json({ error: "url required" });
 
-    // If SA envs exist we purposely don’t use them in this build
+    // If you *do* add SA later, branch here:
     if (process.env.GOOGLE_SA_EMAIL && process.env.GOOGLE_SA_PRIVATE_KEY) {
-      return res.status(200).json({
-        ok: false,
-        error: "Service Account mode not implemented in this build",
-        hint: "Unset GOOGLE_SA_* envs or implement the SA branch."
+      return res.status(400).json({
+        error: "Service Account mode not implemented in this snippet",
+        hint: "You can keep this fallback, or wire SA with official Google API client."
       });
     }
 
-    // Build a CSV URL from various Google formats
-    let csvUrl = "";
-    let spreadsheetId = "";
-    let tabTitle = "Sheet";
+    // ---- Public CSV fallback ----
+    // Accepts either:
+    //  - normal edit URL: https://docs.google.com/spreadsheets/d/{id}/edit#gid={gid}
+    //  - or direct csv:   https://docs.google.com/spreadsheets/d/{id}/export?format=csv&gid={gid}
+    const idMatch = rawUrl.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+    if (!idMatch) return res.status(400).json({ error: "Could not find spreadsheetId in URL" });
+    const spreadsheetId = idMatch[1];
 
-    // Already export?
-    if (/\/spreadsheets\/d\/[^/]+\/export\?/.test(rawUrl)) {
-      csvUrl = rawUrl;
-      const m = rawUrl.match(/\/spreadsheets\/d\/([^/]+)/);
-      if (m) spreadsheetId = m[1];
-      const gid = (rawUrl.match(/[?&]gid=(\d+)/) || [,"0"])[1];
-      tabTitle = `gid:${gid}`;
-    }
+    // extract gid if present; default to 0
+    let gid = "0";
+    const gidHash = rawUrl.match(/[?#]gid=(\d+)/);
+    if (gidHash) gid = gidHash[1];
 
-    // Published link (/d/e/.../pub or pubhtml) → enforce output=csv
-    if (!csvUrl && /\/spreadsheets\/d\/e\/[A-Za-z0-9-_]+\/pub/.test(rawUrl)) {
-      let rewritten = rawUrl.replace(/\/pubhtml(\?|$)/, "/pub$1");
-      if (/[?&]output=/.test(rewritten)) {
-        rewritten = rewritten.replace(/output=[^&]*/i, "output=csv");
-      } else {
-        rewritten += (rewritten.includes("?") ? "&" : "?") + "output=csv";
-      }
-      csvUrl = rewritten;
-      const gid = (rewritten.match(/[?&]gid=(\d+)/) || [,"0"])[1];
-      tabTitle = `gid:${gid}`;
-      spreadsheetId = "(published)";
-    }
-
-    // Editor link (/d/{id}/edit#gid=...)
-    if (!csvUrl) {
-      const m = rawUrl.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
-      if (!m) {
-        return res.status(200).json({
-          ok: false,
-          error: "Unrecognized Google Sheets URL",
-          hint: "Use an editor URL (/d/{id}/edit#gid=...), an export URL, or a published CSV URL (/d/e/.../pub?output=csv).",
-          got: rawUrl
-        });
-      }
-      spreadsheetId = m[1];
-      const gid = (rawUrl.match(/[?#]gid=(\d+)/) || [,"0"])[1];
-      tabTitle = `gid:${gid}`;
+    // build a csv export url
+    let csvUrl = rawUrl;
+    if (!/\/export\?/.test(rawUrl)) {
       csvUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=csv&gid=${gid}`;
     }
 
-    // Fetch CSV (must be public/published)
-    let text;
-    try {
-      const r = await fetch(csvUrl, { redirect: "follow" });
-      if (!r.ok) {
-        return res.status(200).json({
-          ok: false,
-          error: `Google returned ${r.status} ${r.statusText}`,
-          csvUrl,
-          hint: "Open this URL in an incognito window. If it doesn’t download CSV, make the tab public or published."
-        });
-      }
-      text = await r.text();
-    } catch (err) {
-      return res.status(200).json({
-        ok: false,
-        error: `Fetch failed: ${String(err?.message || err)}`,
-        csvUrl
+    // fetch csv (must be published or link-shared "anyone")
+    const r = await fetch(csvUrl);
+    if (!r.ok) {
+      return res.status(r.status).json({
+        error: `Google returned ${r.status} (${r.statusText})`,
+        hint:
+          "If this is private, either publish the tab to the web or switch to OAuth/Service Account."
       });
     }
+    const text = await r.text();
 
-    // Simple CSV parse (handles quoted commas)
-    const lines = text.split(/\r?\n/).filter(Boolean);
-    const headers = (lines[0] || "")
-      .split(/,(?=(?:[^"]*"[^"]*")*[^"]*$)/)
-      .map(h => h.replace(/^"|"$/g, "").trim())
-      .filter(Boolean);
+    // basic parse: first line -> headers (split by comma; very simple CSV)
+    const lines = text.split(/\r?\n/).filter((ln) => ln.length > 0);
+    const first = lines[0] || "";
+    const headers = first.split(",").map((h) => h.replace(/^"|"$/g, "").trim()).filter(Boolean);
+    const estimatedRows = Math.max(0, lines.length - 1); // minus header row
 
-    return res.status(200).json({
-      ok: true,
+    // We don't have metadata (title/tab name) without auth; use fallbacks
+    const spreadsheetTitle = "Published Sheet";
+    const tabTitle = `gid:${gid}`;
+
+    return res.json({
       spreadsheetId,
-      spreadsheetTitle: "Google Sheet",
-      sheets: [{
-        title: tabTitle,
-        estimatedRows: Math.max(0, lines.length - 1),
-        headers: headers.slice(0, 100)
-      }]
+      spreadsheetTitle,
+      sheets: [
+        {
+          title: tabTitle,
+          estimatedRows,
+          headers: headers.slice(0, 100) // keep it bounded
+        }
+      ]
     });
   } catch (e) {
-    console.error("/api/admin/sheets/inspect error:", e?.message || e);
-    // Still return 200 to avoid logout loops; include error payload for UI
-    return res.status(200).json({ ok: false, error: "Inspect failed unexpectedly" });
+    console.error("/api/admin/sheets/inspect fallback error:", e?.message || e);
+    return res.status(500).json({ error: "Inspect failed" });
+  }
+});
+/* ============ PREMIUM ITEMS (Admin) ============ */
+
+// List premium items
+app.get("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { q = "", page = 1, per_page = 50 } = req.query;
+    const pg = Math.max(Number(page) || 1, 1);
+    const pp = Math.min(Math.max(Number(per_page) || 50, 1), 200);
+
+    let query = supabase.from("premium_items").select("*");
+    if (q) {
+      // simple client-side filter since ilike on multiple cols is fine too
+      const { data, error } = await query.order("created_at", { ascending: false }).limit(1000);
+      if (error) throw error;
+      const t = String(q).toLowerCase();
+      const filtered = (data || []).filter((r) =>
+        (r.title || "").toLowerCase().includes(t) ||
+        (r.subtitle || "").toLowerCase().includes(t) ||
+        (r.tags || "").toLowerCase().includes(t)
+      );
+      const start = (pg - 1) * pp;
+      return res.json({ total: filtered.length, page: pg, per_page: pp, items: filtered.slice(start, start + pp) });
+    } else {
+      const from = (pg - 1) * pp;
+      const to = from + pp - 1;
+      const { data, count, error } = await supabase
+        .from("premium_items")
+        .select("*", { count: "exact" })
+        .order("created_at", { ascending: false })
+        .range(from, to);
+      if (error) throw error;
+      return res.json({ total: count ?? (data || []).length, page: pg, per_page: pp, items: data || [] });
+    }
+  } catch (e) {
+    console.error("/api/admin/premium/items GET error:", e?.message || e);
+    res.status(500).json({ error: "Failed to list premium items" });
+  }
+});
+
+// Create/save premium item
+app.post("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const {
+      title,
+      subtitle = "",
+      tags = "",
+      listed = false,
+      min_rows = 1000,
+      price_per_1k_cents = 500,
+      spreadsheet_id = "",
+      gid = "0",
+      sheet_url_admin = "",
+      csv_url_public,
+      headers = [],
+      rows_estimate = 0,
+    } = req.body || {};
+
+    if (!title || !csv_url_public) {
+      return res.status(400).json({ error: "title and csv_url_public are required" });
+    }
+
+    // quick sanity: must be a docs.google.com export/publish url
+    if (!/^https:\/\/docs\.google\.com\/spreadsheets\/.+/.test(String(csv_url_public))) {
+      return res.status(400).json({ error: "csv_url_public must be a Google Sheets CSV URL" });
+    }
+
+    const row = {
+      title: String(title).trim(),
+      subtitle: String(subtitle || "").trim(),
+      tags: String(tags || "").trim(),
+      listed: !!listed,
+      min_rows: Math.max(1, Number(min_rows || 1)),
+      price_per_1k_cents: Math.max(0, Number(price_per_1k_cents || 0)),
+      spreadsheet_id: String(spreadsheet_id || ""),
+      gid: String(gid || "0"),
+      sheet_url_admin: String(sheet_url_admin || ""),
+      csv_url_public: String(csv_url_public),
+      headers: Array.isArray(headers) ? headers.slice(0, 200) : [],
+      rows_estimate: Math.max(0, Number(rows_estimate || 0)),
+      created_at: nowISO(),
+    };
+
+    const { data, error } = await supabase.from("premium_items").insert(row).select().single();
+    if (error) throw error;
+    res.json({ ok: true, item: data });
+  } catch (e) {
+    console.error("/api/admin/premium/items POST error:", e?.message || e);
+    res.status(500).json({ error: "Failed to save premium item" });
+  }
+});
+
+// Optional: patch & delete
+app.patch("/api/admin/premium/items/:id", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = String(req.params.id);
+    const patch = req.body || {};
+    const { data, error } = await supabase.from("premium_items").update(patch).eq("id", id).select().single();
+    if (error) throw error;
+    res.json({ ok: true, item: data });
+  } catch (e) {
+    console.error("/api/admin/premium/items/:id PATCH error:", e?.message || e);
+    res.status(500).json({ error: "Failed to update premium item" });
+  }
+});
+
+app.delete("/api/admin/premium/items/:id", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = String(req.params.id);
+    const { error } = await supabase.from("premium_items").delete().eq("id", id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("/api/admin/premium/items/:id DELETE error:", e?.message || e);
+    res.status(500).json({ error: "Failed to delete premium item" });
   }
 });
 
