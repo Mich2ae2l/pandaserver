@@ -2400,6 +2400,7 @@ app.get("/api/premium/stats", async (_req, res) => {
 });
 
 // Create/save premium item (fixed to match DB columns)
+// Create/save premium item (FIXED: price_per_1k_cents + computed price_cents)
 app.post("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res) => {
   try {
     let {
@@ -2407,37 +2408,45 @@ app.post("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res)
       subtitle = "",
       tags = "",
       listed = false,
-      min_rows = 1000,
-      price_per_1k_cents = 500,     // UI name; we map it to price_cents
+
+      // pricing inputs
+      min_rows = 1000,               // UI minimum rows
+      price_per_1k_cents = 500,      // guide price per 1000 rows (in cents)
+      price_cents,                   // OPTIONAL explicit total price override (in cents)
+
+      // sheet sources
       spreadsheet_id = "",
       gid = "0",
       sheet_url_admin = "",
-      delivery_url = "",            // admin-only link, optional
+      delivery_url = "",             // admin-only link, optional
       csv_url_public,
+
+      // metadata
       headers = [],
       rows_estimate = 0,
     } = req.body || {};
 
-    // Use either sheet_url_admin or delivery_url as the admin-only sheet URL
+    // ---------- Normalize admin URL -> public CSV, spreadsheet_id, gid ----------
     const adminUrl = (sheet_url_admin || delivery_url || "").trim();
 
-    // Backfill csv_url_public from adminUrl + gid when missing
     if (!csv_url_public && adminUrl) {
       const m = adminUrl.match(/\/spreadsheets\/d\/([A-Za-z0-9-_]+)/i);
       if (m) {
         const id = m[1];
-        const g = (adminUrl.match(/[?#]gid=(\d+)/) || [,"0"])[1];
+        const g = (adminUrl.match(/[?#]gid=(\d+)/) || [, "0"])[1];
         gid = gid || g;
         csv_url_public = `https://docs.google.com/spreadsheets/d/${id}/export?format=csv&gid=${gid}`;
         spreadsheet_id = spreadsheet_id || id;
         sheet_url_admin = adminUrl; // normalize
       } else if (/\/spreadsheets\/d\/e\/[A-Za-z0-9-_]+\/pub/i.test(adminUrl)) {
         const u2 = new URL(adminUrl);
-        if (!u2.searchParams.get("output")) u2.searchParams.set("output","csv");
-        if (!u2.searchParams.get("single")) u2.searchParams.set("single","true");
-        if (!u2.searchParams.get("gid"))    u2.searchParams.set("gid", gid || "0");
+        if (!u2.searchParams.get("output")) u2.searchParams.set("output", "csv");
+        if (!u2.searchParams.get("single")) u2.searchParams.set("single", "true");
+        if (!u2.searchParams.get("gid")) u2.searchParams.set("gid", gid || "0");
         csv_url_public = u2.toString();
-        spreadsheet_id = spreadsheet_id || (adminUrl.match(/\/spreadsheets\/d\/e\/([A-Za-z0-9-_]+)/)?.[1] || "");
+        spreadsheet_id =
+          spreadsheet_id ||
+          (adminUrl.match(/\/spreadsheets\/d\/e\/([A-Za-z0-9-_]+)/)?.[1] || "");
         sheet_url_admin = adminUrl; // normalize
       }
     }
@@ -2446,45 +2455,59 @@ app.post("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res)
       return res.status(400).json({ error: "title and csv_url_public are required" });
     }
 
-    // *** IMPORTANT: match your table columns ***
-    // - service is NOT NULL in your DB -> set it explicitly
-    // - your table uses price_cents (not price_per_1k_cents)
+    // ---------- Pricing logic ----------
+    const rows = Math.max(0, Number(rows_estimate || 0));
+    const guidePer1k = Math.max(0, Number(price_per_1k_cents || 0));
+    // allow explicit total override from body; else compute from rows × per-1k
+    let totalCents = Number(price_cents);
+    if (!totalCents && guidePer1k && rows) {
+      totalCents = Math.round((rows / 1000) * guidePer1k);
+    }
+    totalCents = Math.max(0, Number(totalCents || 0));
+
+    // ---------- Build row (match table columns) ----------
     const row = {
       title: String(title).trim(),
       subtitle: String(subtitle || "").trim(),
       listed: !!listed,
 
-     service: "sheets",
-              // <— REQUIRED to satisfy NOT NULL
-      delivery_type: "gated",                   // ok if this column exists (else remove)
-      delivery_url: String(delivery_url || ""), // ok if this column exists (else remove)
+      service: "sheets",                         // NOT NULL in your DB
+      delivery_type: "gated",                    // keep if column exists
+      delivery_url: String(delivery_url || ""),  // keep if column exists
 
       min_rows: Math.max(1, Number(min_rows || 1)),
-      price_cents: Math.max(0, Number(price_per_1k_cents || 0)), // <— map UI -> DB
+
+      // store both the guide and the final total price
+      price_per_1k_cents: guidePer1k,            // shown as "Guide: $X / 1k rows"
+      price_cents: totalCents,                   // total price shown in card
 
       spreadsheet_id: String(spreadsheet_id || ""),
       gid: String(gid || "0"),
       sheet_url_admin: String(sheet_url_admin || ""),
       csv_url_public: String(csv_url_public),
-     tags: String(tags || "").trim(), 
-      headers: Array.isArray(headers) ? headers.slice(0, 200) : [],
-      rows_estimate: Math.max(0, Number(rows_estimate || 0)),
 
-      // put “optional/extras” somewhere safe if you have a meta column; otherwise ignore
-      // meta: { tags: String(tags || "").trim() },
+      tags: String(tags || "").trim(),
+      headers: Array.isArray(headers) ? headers.slice(0, 200) : [],
+      rows_estimate: rows,
 
       created_at: nowISO(),
       updated_at: nowISO(),
     };
 
-    const { data, error } = await supabase.from("premium_items").insert(row).select().single();
+    const { data, error } = await supabase
+      .from("premium_items")
+      .insert(row)
+      .select()
+      .single();
+
     if (error) throw error;
-    res.json({ ok: true, item: data });
+    return res.json({ ok: true, item: data });
   } catch (e) {
     console.error("/api/admin/premium/items POST error:", e?.message || e);
-    res.status(500).json({ error: "Failed to save premium item" });
+    return res.status(500).json({ error: "Failed to save premium item" });
   }
 });
+
 
 
 
