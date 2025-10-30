@@ -77,6 +77,7 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
+app.use(helmet.hsts({ maxAge: 15552000, includeSubDomains: true, preload: true }));
 
 /* ---------- HELMET AFTER CORS ---------- */
 app.use(
