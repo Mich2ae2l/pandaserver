@@ -2245,27 +2245,33 @@ app.post("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res)
       spreadsheet_id = "",
       gid = "0",
       sheet_url_admin = "",
+      delivery_url = "", // <— NEW: support UI field
       csv_url_public,
       headers = [],
       rows_estimate = 0,
     } = req.body || {};
 
-    // Backfill csv_url_public from sheet_url_admin + gid when missing
-    if (!csv_url_public && sheet_url_admin) {
-      const m = sheet_url_admin.match(/\/spreadsheets\/d\/([A-Za-z0-9-_]+)/i);
+    // Use either sheet_url_admin or delivery_url as the admin-only sheet URL
+    const adminUrl = (sheet_url_admin || delivery_url || "").trim();
+
+    // Backfill csv_url_public from adminUrl + gid when missing
+    if (!csv_url_public && adminUrl) {
+      const m = adminUrl.match(/\/spreadsheets\/d\/([A-Za-z0-9-_]+)/i);
       if (m) {
         const id = m[1];
-        const g = (sheet_url_admin.match(/[?#]gid=(\d+)/) || [,"0"])[1];
+        const g = (adminUrl.match(/[?#]gid=(\d+)/) || [,"0"])[1];
         gid = gid || g;
         csv_url_public = `https://docs.google.com/spreadsheets/d/${id}/export?format=csv&gid=${gid}`;
         spreadsheet_id = spreadsheet_id || id;
-      } else if (/\/spreadsheets\/d\/e\/[A-Za-z0-9-_]+\/pub/i.test(sheet_url_admin)) {
-        const u2 = new URL(sheet_url_admin);
+        sheet_url_admin = adminUrl; // normalize
+      } else if (/\/spreadsheets\/d\/e\/[A-Za-z0-9-_]+\/pub/i.test(adminUrl)) {
+        const u2 = new URL(adminUrl);
         if (!u2.searchParams.get("output")) u2.searchParams.set("output","csv");
         if (!u2.searchParams.get("single")) u2.searchParams.set("single","true");
         if (!u2.searchParams.get("gid"))    u2.searchParams.set("gid", gid || "0");
         csv_url_public = u2.toString();
-        spreadsheet_id = spreadsheet_id || (sheet_url_admin.match(/\/spreadsheets\/d\/e\/([A-Za-z0-9-_]+)/)?.[1] || "");
+        spreadsheet_id = spreadsheet_id || (adminUrl.match(/\/spreadsheets\/d\/e\/([A-Za-z0-9-_]+)/)?.[1] || "");
+        sheet_url_admin = adminUrl; // normalize
       }
     }
 
@@ -2273,10 +2279,7 @@ app.post("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res)
       return res.status(400).json({ error: "title and csv_url_public are required" });
     }
 
-    if (!/^https:\/\/docs\.google\.com\/spreadsheets\/.+/.test(String(csv_url_public))) {
-      return res.status(400).json({ error: "csv_url_public must be a Google Sheets CSV URL" });
-    }
-
+ 
     const row = {
       title: String(title).trim(),
       subtitle: String(subtitle || "").trim(),
