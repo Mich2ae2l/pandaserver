@@ -2295,33 +2295,47 @@ app.get("/api/premium/items", async (req, res) => {
   }
 });
 // NEW: purchase a premium item
+// NEW: premium purchase with UUID guard and clear errors
 app.post("/api/premium/purchase", requireAuth, async (req, res) => {
   try {
+    // block legacy non-UUID accounts (prevents Supabase uuid-cast errors)
+    if (!isUuid(req.user.id)) {
+      return res.status(400).json({
+        error:
+          "This account uses an old ID format and cannot purchase premium items. Please create a new account."
+      });
+    }
+
     const { id } = req.body || {};
     if (!id) return res.status(400).json({ error: "id required" });
 
     // fetch item
-    const { data: item, error } = await supabase
+    const { data: item, error: itemErr } = await supabase
       .from("premium_items")
       .select("*")
       .eq("id", id)
       .maybeSingle();
-    if (error) throw error;
+    if (itemErr) throw itemErr;
     if (!item || !item.listed) return res.status(404).json({ error: "Not found" });
 
-    const price = Number(item.price_cents || 0);
+    const price = Math.max(0, Number(item.price_cents || 0)); // cents
     const user = await getUserById(req.user.id);
     if (!user) return res.status(401).json({ error: "User not found" });
 
-    if ((user.balance_cents || 0) < price) {
-      return res.status(400).json({ error: "Insufficient balance" });
+    const bal = Math.max(0, Number(user.balance_cents || 0)); // cents
+
+    if (bal < price) {
+      return res.status(400).json({
+        error: "Insufficient balance",
+        need_cents: price,
+        have_cents: bal
+      });
     }
 
-    // debit balance
-    const newBal = Math.max(0, Math.round((user.balance_cents || 0) - price));
+    // debit and record
+    const newBal = bal - price;
     await updateUser(user.id, { balance_cents: newBal });
 
-    // record transaction
     await insertTransaction({
       id: nanoid(),
       user_id: user.id,
@@ -2333,15 +2347,15 @@ app.post("/api/premium/purchase", requireAuth, async (req, res) => {
       created_at: nowISO(),
     });
 
-    // Optionally mark entitlement table; for now return ok
     notifyUser(user.id, "balance", { balance_cents: newBal, reason: "premium_purchase" });
 
-    res.json({ ok: true, new_balance_cents: newBal });
+    return res.json({ ok: true, new_balance_cents: newBal });
   } catch (e) {
     console.error("/api/premium/purchase error:", e?.message || e);
-    res.status(500).json({ error: "Purchase failed" });
+    return res.status(500).json({ error: "Purchase failed" });
   }
 });
+
 
 // NEW: gated download link for a premium item
 // replace the body of /api/premium/items/:id/download
