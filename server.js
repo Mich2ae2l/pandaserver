@@ -2114,76 +2114,116 @@ if (fs.existsSync(clientIndex)) {
     res.status(200).send("Frontend is hosted separately. Visit the Netlify site.")
   );
 }
-/* ============ SHEETS INSPECT (no SA fallback) ============ */
+/* ============ SHEETS INSPECT (always 200 on functional errors) ============ */
 app.post("/api/admin/sheets/inspect", requireAuth, requireAdmin, async (req, res) => {
   try {
-    const rawUrl = String(req.body?.url || "").trim();
-    if (!rawUrl) return res.status(400).json({ error: "url required" });
+    // DEBUG: confirm we have a user + admin
+    if (!req.user?.id) {
+      return res.status(401).json({ ok: false, error: "Missing user on request" });
+    }
 
-    // If you *do* add SA later, branch here:
+    const rawUrl = String(req.body?.url || "").trim();
+    if (!rawUrl) return res.status(200).json({ ok: false, error: "url required" });
+
+    // If SA envs exist we purposely don’t use them in this build
     if (process.env.GOOGLE_SA_EMAIL && process.env.GOOGLE_SA_PRIVATE_KEY) {
-      return res.status(400).json({
-        error: "Service Account mode not implemented in this snippet",
-        hint: "You can keep this fallback, or wire SA with official Google API client."
+      return res.status(200).json({
+        ok: false,
+        error: "Service Account mode not implemented in this build",
+        hint: "Unset GOOGLE_SA_* envs or implement the SA branch."
       });
     }
 
-    // ---- Public CSV fallback ----
-    // Accepts either:
-    //  - normal edit URL: https://docs.google.com/spreadsheets/d/{id}/edit#gid={gid}
-    //  - or direct csv:   https://docs.google.com/spreadsheets/d/{id}/export?format=csv&gid={gid}
-    const idMatch = rawUrl.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
-    if (!idMatch) return res.status(400).json({ error: "Could not find spreadsheetId in URL" });
-    const spreadsheetId = idMatch[1];
+    // Build a CSV URL from various Google formats
+    let csvUrl = "";
+    let spreadsheetId = "";
+    let tabTitle = "Sheet";
 
-    // extract gid if present; default to 0
-    let gid = "0";
-    const gidHash = rawUrl.match(/[?#]gid=(\d+)/);
-    if (gidHash) gid = gidHash[1];
+    // Already export?
+    if (/\/spreadsheets\/d\/[^/]+\/export\?/.test(rawUrl)) {
+      csvUrl = rawUrl;
+      const m = rawUrl.match(/\/spreadsheets\/d\/([^/]+)/);
+      if (m) spreadsheetId = m[1];
+      const gid = (rawUrl.match(/[?&]gid=(\d+)/) || [,"0"])[1];
+      tabTitle = `gid:${gid}`;
+    }
 
-    // build a csv export url
-    let csvUrl = rawUrl;
-    if (!/\/export\?/.test(rawUrl)) {
+    // Published link (/d/e/.../pub or pubhtml) → enforce output=csv
+    if (!csvUrl && /\/spreadsheets\/d\/e\/[A-Za-z0-9-_]+\/pub/.test(rawUrl)) {
+      let rewritten = rawUrl.replace(/\/pubhtml(\?|$)/, "/pub$1");
+      if (/[?&]output=/.test(rewritten)) {
+        rewritten = rewritten.replace(/output=[^&]*/i, "output=csv");
+      } else {
+        rewritten += (rewritten.includes("?") ? "&" : "?") + "output=csv";
+      }
+      csvUrl = rewritten;
+      const gid = (rewritten.match(/[?&]gid=(\d+)/) || [,"0"])[1];
+      tabTitle = `gid:${gid}`;
+      spreadsheetId = "(published)";
+    }
+
+    // Editor link (/d/{id}/edit#gid=...)
+    if (!csvUrl) {
+      const m = rawUrl.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+      if (!m) {
+        return res.status(200).json({
+          ok: false,
+          error: "Unrecognized Google Sheets URL",
+          hint: "Use an editor URL (/d/{id}/edit#gid=...), an export URL, or a published CSV URL (/d/e/.../pub?output=csv).",
+          got: rawUrl
+        });
+      }
+      spreadsheetId = m[1];
+      const gid = (rawUrl.match(/[?#]gid=(\d+)/) || [,"0"])[1];
+      tabTitle = `gid:${gid}`;
       csvUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=csv&gid=${gid}`;
     }
 
-    // fetch csv (must be published or link-shared "anyone")
-    const r = await fetch(csvUrl);
-    if (!r.ok) {
-      return res.status(r.status).json({
-        error: `Google returned ${r.status} (${r.statusText})`,
-        hint:
-          "If this is private, either publish the tab to the web or switch to OAuth/Service Account."
+    // Fetch CSV (must be public/published)
+    let text;
+    try {
+      const r = await fetch(csvUrl, { redirect: "follow" });
+      if (!r.ok) {
+        return res.status(200).json({
+          ok: false,
+          error: `Google returned ${r.status} ${r.statusText}`,
+          csvUrl,
+          hint: "Open this URL in an incognito window. If it doesn’t download CSV, make the tab public or published."
+        });
+      }
+      text = await r.text();
+    } catch (err) {
+      return res.status(200).json({
+        ok: false,
+        error: `Fetch failed: ${String(err?.message || err)}`,
+        csvUrl
       });
     }
-    const text = await r.text();
 
-    // basic parse: first line -> headers (split by comma; very simple CSV)
-    const lines = text.split(/\r?\n/).filter((ln) => ln.length > 0);
-    const first = lines[0] || "";
-    const headers = first.split(",").map((h) => h.replace(/^"|"$/g, "").trim()).filter(Boolean);
-    const estimatedRows = Math.max(0, lines.length - 1); // minus header row
+    // Simple CSV parse (handles quoted commas)
+    const lines = text.split(/\r?\n/).filter(Boolean);
+    const headers = (lines[0] || "")
+      .split(/,(?=(?:[^"]*"[^"]*")*[^"]*$)/)
+      .map(h => h.replace(/^"|"$/g, "").trim())
+      .filter(Boolean);
 
-    // We don't have metadata (title/tab name) without auth; use fallbacks
-    const spreadsheetTitle = "Published Sheet";
-    const tabTitle = `gid:${gid}`;
-
-    return res.json({
+    return res.status(200).json({
+      ok: true,
       spreadsheetId,
-      spreadsheetTitle,
-      sheets: [
-        {
-          title: tabTitle,
-          estimatedRows,
-          headers: headers.slice(0, 100) // keep it bounded
-        }
-      ]
+      spreadsheetTitle: "Google Sheet",
+      sheets: [{
+        title: tabTitle,
+        estimatedRows: Math.max(0, lines.length - 1),
+        headers: headers.slice(0, 100)
+      }]
     });
   } catch (e) {
-    console.error("/api/admin/sheets/inspect fallback error:", e?.message || e);
-    return res.status(500).json({ error: "Inspect failed" });
+    console.error("/api/admin/sheets/inspect error:", e?.message || e);
+    // Still return 200 to avoid logout loops; include error payload for UI
+    return res.status(200).json({ ok: false, error: "Inspect failed unexpectedly" });
   }
 });
+
 
 
 /* ------------ FINAL: /api catch-all 404 ------------ */
