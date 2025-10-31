@@ -700,29 +700,58 @@ app.get("/api/inventory/count", async (_req, res) => {
 });
 
 /* ---------------- Library ---------------- */
-app.get("/api/me/library", requireAuth, async (req, res) => {
+app.get("/api/me/library/all", requireAuth, async (req, res) => {
   try {
-    if (!isUuid(req.user.id)) return res.json({ items: [] });
-    const { data, error } = await supabase
-      .from(T_PDFS)
+    // PDFs
+    const { data: pdfRows, error: pdfErr } = await supabase
+      .from("pdfs")
       .select("*")
       .eq("buyer_user_id", req.user.id)
       .order("sold_at", { ascending: false });
-    if (error) throw error;
-    const items = (data || []).map(normalizePdfRow).map((p) => ({
-      id: p.id,
+    if (pdfErr) throw pdfErr;
+
+    const pdfs = (pdfRows || []).map(p => ({
+      id: String(p.id),
+      type: "pdf",
       title: p.title,
       state: p.state,
       year: p.year,
       price_cents: p.price_cents,
-      storage_path: p.storage_path,
+      storage_path:
+        p.storage_path ||
+        (p.file_name ? (process.env.SUPABASE_STORAGE_PREFIX ? `${process.env.SUPABASE_STORAGE_PREFIX}/${p.file_name}` : p.file_name) : ""),
+      download_api: `/api/download/token/${p.id}`, // your client can POST here to get a signed URL
+      purchased_at: p.sold_at || p.created_at
     }));
-    res.json({ items });
+
+    // Premium items (sheets)
+    const { data: entRows, error: entErr } = await supabase
+      .from("premium_entitlements")
+      .select("item_id, premium_items(*)")
+      .eq("user_id", req.user.id);
+    if (entErr) throw entErr;
+
+    const sheets = (entRows || []).map(r => {
+      const it = r.premium_items || {};
+      return {
+        id: String(it.id),
+        type: "premium_sheet",
+        title: it.title,
+        subtitle: it.subtitle || "",
+        price_cents: Number(it.price_cents || 0),
+        csv_url_public: it.csv_url_public || null,
+        download_api: `/api/premium/items/${it.id}/download`,
+        purchased_at: it.updated_at || it.created_at
+      };
+    });
+
+    res.json({ items: [...pdfs, ...sheets].sort((a, b) => (new Date(b.purchased_at||0)) - (new Date(a.purchased_at||0))) });
   } catch (e) {
-    console.error("/api/me/library error:", e?.message || e);
+    console.error("/api/me/library/all error:", e?.message || e);
     res.status(500).json({ error: "Failed to fetch library" });
   }
 });
+
 app.get("/api/library", requireAuth, async (req, res) => {
   try {
     if (!isUuid(req.user.id)) return res.json({ items: [] });
