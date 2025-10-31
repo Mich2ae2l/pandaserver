@@ -2237,15 +2237,11 @@ app.get("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res) 
 // REPLACE your current: app.get("/api/premium/items", ...)
 app.get("/api/premium/items", async (req, res) => {
   try {
-    // service: "sheets" | "documents"
     const svc = String(req.query.service || "sheets").toLowerCase();
     const page = Math.max(Number(req.query.page) || 1, 1);
     const per_page = Math.min(Math.max(Number(req.query.per_page) || 30, 1), 200);
-
-    // allow both "documents" and "docs"
     const serviceFilter = svc === "documents" ? ["documents", "docs"] : [svc];
 
-    // basic query
     const from = (page - 1) * per_page;
     const to = from + per_page - 1;
 
@@ -2256,8 +2252,21 @@ app.get("/api/premium/items", async (req, res) => {
       .eq("listed", true)
       .order("created_at", { ascending: false })
       .range(from, to);
-
     if (error) throw error;
+
+    // optional: find owned for the caller
+    let ownedIds = new Set();
+    try {
+      const token = getJwtFromReq(req);
+      if (token) {
+        const me = jwt.verify(token, process.env.JWT_SECRET || "dev_secret");
+        const { data: ent } = await supabase
+          .from("premium_entitlements")
+          .select("item_id")
+          .eq("user_id", me.id);
+        ownedIds = new Set((ent || []).map((r) => r.item_id));
+      }
+    } catch {}
 
     const items = (data || []).map((r) => ({
       id: r.id,
@@ -2267,7 +2276,7 @@ app.get("/api/premium/items", async (req, res) => {
       price_cents: Number(r.price_cents || 0),
       label: r.label || null,
       listed: !!r.listed,
-      owned: false, // set true after purchase API if you track ownership
+      owned: ownedIds.has(r.id),
       meta: {
         tags: (r.tags || "")
           .split(/[|,]/)
@@ -2276,89 +2285,118 @@ app.get("/api/premium/items", async (req, res) => {
         rows: Number(r.rows_estimate || 0),
         updated_at: r.updated_at || r.created_at || null,
         sample_headers: Array.isArray(r.headers) ? r.headers : [],
-        // optional guidance fields used by the offer UI:
         min_chunk_rows: Number(r.min_rows || 0) || undefined,
         price_per_1000_cents: Number(r.price_per_1k_cents || r.price_per_1000_cents || 0) || undefined,
         offer_suggestions: Array.isArray(r.offer_suggestions) ? r.offer_suggestions.slice(0, 5) : [],
       },
     }));
 
-    res.json({
-      items,
-      total: count ?? items.length,
-      page,
-      per_page,
-    });
+    res.json({ items, total: count ?? items.length, page, per_page });
   } catch (e) {
     console.error("/api/premium/items public list error:", e?.message || e);
     res.status(500).json({ error: "Failed to list premium items" });
   }
 });
+
+// My purchased premium items
+app.get("/api/me/premium", requireAuth, async (req, res) => {
+  try {
+    const { data: rows, error } = await supabase
+      .from("premium_entitlements")
+      .select("item_id, premium_items(*)")
+      .eq("user_id", req.user.id);
+    if (error) throw error;
+
+    const items = (rows || []).map((r) => {
+      const it = r.premium_items || {};
+      return {
+        id: it.id,
+        title: it.title,
+        subtitle: it.subtitle || "",
+        service: it.service || "sheets",
+        price_cents: Number(it.price_cents || 0),
+        csv_url_public: it.csv_url_public || null,     // for client to show “Download”
+        updated_at: it.updated_at || it.created_at || null,
+      };
+    });
+
+    res.json({ items });
+  } catch (e) {
+    console.error("/api/me/premium error:", e?.message || e);
+    res.status(500).json({ error: "Failed to fetch premium library" });
+  }
+});
+
+
 // NEW: purchase a premium item
 // NEW: premium purchase with UUID guard and clear errors
+// PURCHASE a premium item -> debit, tx, entitlement
 app.post("/api/premium/purchase", requireAuth, async (req, res) => {
   try {
-    // block legacy non-UUID accounts (prevents Supabase uuid-cast errors)
-    if (!isUuid(req.user.id)) {
-      return res.status(400).json({
-        error:
-          "This account uses an old ID format and cannot purchase premium items. Please create a new account."
-      });
-    }
-
     const { id } = req.body || {};
     if (!id) return res.status(400).json({ error: "id required" });
 
     // fetch item
-    const { data: item, error: itemErr } = await supabase
+    const { data: item, error } = await supabase
       .from("premium_items")
       .select("*")
       .eq("id", id)
       .maybeSingle();
-    if (itemErr) throw itemErr;
+    if (error) throw error;
     if (!item || !item.listed) return res.status(404).json({ error: "Not found" });
 
-    const price = Math.max(0, Number(item.price_cents || 0)); // cents
+    const price = Number(item.price_cents || 0);
     const user = await getUserById(req.user.id);
     if (!user) return res.status(401).json({ error: "User not found" });
 
-    const bal = Math.max(0, Number(user.balance_cents || 0)); // cents
-
-    if (bal < price) {
-      return res.status(400).json({
-        error: "Insufficient balance",
-        need_cents: price,
-        have_cents: bal
-      });
+    // already owned? (idempotent)
+    {
+      const { data: ent } = await supabase
+        .from("premium_entitlements")
+        .select("user_id")
+        .eq("user_id", user.id)
+        .eq("item_id", id)
+        .maybeSingle();
+      if (ent) return res.json({ ok: true, new_balance_cents: user.balance_cents || 0, already_owned: true });
     }
 
-    // debit and record
-    const newBal = bal - price;
+    // funds
+    if ((user.balance_cents || 0) < price) {
+      return res.status(400).json({ error: "Insufficient balance" });
+    }
+    const newBal = Math.max(0, Math.round((user.balance_cents || 0) - price));
     await updateUser(user.id, { balance_cents: newBal });
 
+    // record tx (now with premium_item_id)
     await insertTransaction({
       id: nanoid(),
       user_id: user.id,
       type: "purchase",
-      premium_item_id: item.id,
+      premium_item_id: id,
       amount_cents: price,
       currency: "USD",
       status: "completed",
       created_at: nowISO(),
     });
 
+    // grant entitlement
+    const { error: entErr } = await supabase
+      .from("premium_entitlements")
+      .insert({ user_id: user.id, item_id: id });
+    if (entErr) throw entErr;
+
     notifyUser(user.id, "balance", { balance_cents: newBal, reason: "premium_purchase" });
 
-    return res.json({ ok: true, new_balance_cents: newBal });
+    res.json({ ok: true, new_balance_cents: newBal });
   } catch (e) {
     console.error("/api/premium/purchase error:", e?.message || e);
-    return res.status(500).json({ error: "Purchase failed" });
+    res.status(500).json({ error: "Purchase failed" });
   }
 });
 
 
-// NEW: gated download link for a premium item
-// replace the body of /api/premium/items/:id/download
+
+// /api/premium/items/:id/download
 app.get("/api/premium/items/:id/download", requireAuth, async (req, res) => {
   try {
     const id = String(req.params.id);
@@ -2371,26 +2409,27 @@ app.get("/api/premium/items/:id/download", requireAuth, async (req, res) => {
     if (error) throw error;
     if (!item) return res.status(404).json({ error: "Not found" });
 
-    // authorize: has user purchased this premium item?
-    const { data: tx, error: txErr } = await supabase
-      .from(T_TX)
-      .select("id")
-      .eq("user_id", req.user.id)
-      .eq("type", "purchase")
-      .eq("premium_item_id", id)
-      .eq("status", "completed")
-      .limit(1)
-      .maybeSingle();
-    if (txErr) throw txErr;
-    if (!tx && !req.user.is_admin) return res.status(403).json({ error: "Purchase required" });
+    // authorized if admin or has entitlement
+    if (!req.user.is_admin) {
+      const { data: ent } = await supabase
+        .from("premium_entitlements")
+        .select("user_id")
+        .eq("user_id", req.user.id)
+        .eq("item_id", id)
+        .maybeSingle();
+      if (!ent) return res.status(403).json({ error: "Purchase required" });
+    }
 
     if (item.csv_url_public) return res.redirect(302, item.csv_url_public);
+
     return res.status(400).json({ error: "No delivery URL configured" });
   } catch (e) {
     console.error("/api/premium/items/:id/download error:", e?.message || e);
     res.status(500).json({ error: "Download failed" });
   }
 });
+
+
 
 
 app.get("/api/premium/stats", async (_req, res) => {
