@@ -2163,33 +2163,33 @@ app.post("/api/admin/sheets/inspect", requireAuth, requireAdmin, async (req, res
     let gid = "0";
 
     // 1) Already an "export?format=csv" URL: use as-is, just ensure gid
-    if (/\/spreadsheets\/d\/[^/]+\/export\?/i.test(rawUrl)) {
-      const u = new URL(rawUrl);
-      gid = u.searchParams.get("gid") || "0";
-      if (!u.searchParams.get("format")) u.searchParams.set("format", "csv");
-      csvUrl = u.toString();
-    }
-    // 2) Publish-to-web: /spreadsheets/d/e/<KEY>/pub?... -> keep, force output=csv & gid
-    else if (/\/spreadsheets\/d\/e\/[A-Za-z0-9-_]+\/pub/i.test(rawUrl)) {
-      const u = new URL(rawUrl);
-      gid = u.searchParams.get("gid") || "0";
-      // Some publish links use ?output=csv, others need single=true
-      if (!u.searchParams.get("output")) u.searchParams.set("output", "csv");
-      if (!u.searchParams.get("single")) u.searchParams.set("single", "true");
-      u.searchParams.set("gid", gid);
-      csvUrl = u.toString();
-    }
-    // 3) Normal edit URL: /spreadsheets/d/<ID>/edit#gid=<gid> -> rewrite to export
-    else {
-      const idMatch = rawUrl.match(/\/spreadsheets\/d\/([A-Za-z0-9-_]+)/i);
-      if (!idMatch) {
-        return res.status(400).json({ error: "Could not find spreadsheetId in URL" });
-      }
-      const spreadsheetId = idMatch[1];
-      const mGid = rawUrl.match(/[?#]gid=(\d+)/);
-      gid = mGid ? mGid[1] : "0";
-      csvUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=csv&gid=${gid}`;
-    }
+if (/\/spreadsheets\/d\/[^/]+\/export\?/i.test(rawUrl)) {
+  const u = new URL(rawUrl);
+  gid = u.searchParams.get("gid") || "0";
+  if (!u.searchParams.get("format")) u.searchParams.set("format", "csv");
+  csvUrl = u.toString();
+}
+// 2) PUBLISH-TO-WEB links: /spreadsheets/d/e/<KEY>/pub ...
+else if (/\/spreadsheets\/d\/e\/[A-Za-z0-9-_]+\/pub/i.test(rawUrl)) {
+  const u = new URL(rawUrl);
+  gid = u.searchParams.get("gid") || "0";
+  if (!u.searchParams.get("output")) u.searchParams.set("output", "csv");
+  if (!u.searchParams.get("single")) u.searchParams.set("single", "true");
+  u.searchParams.set("gid", gid);
+  csvUrl = u.toString();
+}
+// 3) Normal edit links ONLY (be strict; don't match /d/e/…)
+else {
+  const idMatch = rawUrl.match(/\/spreadsheets\/d\/(?!e\/)([A-Za-z0-9-_]+)/i);
+  if (!idMatch) {
+    return res.status(400).json({ error: "Could not find spreadsheetId in URL" });
+  }
+  const spreadsheetId = idMatch[1];
+  const mGid = rawUrl.match(/[?#]gid=(\d+)/);
+  gid = mGid ? mGid[1] : "0";
+  csvUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=csv&gid=${gid}`;
+}
+
 
     // Fetch CSV (must be public to "Anyone with the link" or Published)
     const r = await fetch(csvUrl);
@@ -2509,29 +2509,35 @@ app.post("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res)
     } = req.body || {};
 
     // ---------- Normalize admin URL -> public CSV, spreadsheet_id, gid ----------
-    const adminUrl = (sheet_url_admin || delivery_url || "").trim();
+    // ---------- Normalize admin URL -> public CSV, spreadsheet_id, gid ----------
+const adminUrl = (sheet_url_admin || delivery_url || "").trim();
 
-    if (!csv_url_public && adminUrl) {
-      const m = adminUrl.match(/\/spreadsheets\/d\/([A-Za-z0-9-_]+)/i);
-      if (m) {
-        const id = m[1];
-        const g = (adminUrl.match(/[?#]gid=(\d+)/) || [, "0"])[1];
-        gid = gid || g;
-        csv_url_public = `https://docs.google.com/spreadsheets/d/${id}/export?format=csv&gid=${gid}`;
-        spreadsheet_id = spreadsheet_id || id;
-        sheet_url_admin = adminUrl; // normalize
-      } else if (/\/spreadsheets\/d\/e\/[A-Za-z0-9-_]+\/pub/i.test(adminUrl)) {
-        const u2 = new URL(adminUrl);
-        if (!u2.searchParams.get("output")) u2.searchParams.set("output", "csv");
-        if (!u2.searchParams.get("single")) u2.searchParams.set("single", "true");
-        if (!u2.searchParams.get("gid")) u2.searchParams.set("gid", gid || "0");
-        csv_url_public = u2.toString();
-        spreadsheet_id =
-          spreadsheet_id ||
-          (adminUrl.match(/\/spreadsheets\/d\/e\/([A-Za-z0-9-_]+)/)?.[1] || "");
-        sheet_url_admin = adminUrl; // normalize
-      }
+if (!csv_url_public && adminUrl) {
+  if (/\/spreadsheets\/d\/e\/[A-Za-z0-9-_]+\/pub/i.test(adminUrl)) {
+    const u2 = new URL(adminUrl);
+    if (!u2.searchParams.get("output")) u2.searchParams.set("output", "csv");
+    if (!u2.searchParams.get("single")) u2.searchParams.set("single", "true");
+    if (!u2.searchParams.get("gid")) u2.searchParams.set("gid", gid || "0");
+    csv_url_public = u2.toString();
+
+    // keep optional references
+    spreadsheet_id = spreadsheet_id ||
+      (adminUrl.match(/\/spreadsheets\/d\/e\/([A-Za-z0-9-_]+)/)?.[1] || "");
+    sheet_url_admin = adminUrl;
+  } else {
+    const idMatch = adminUrl.match(/\/spreadsheets\/d\/(?!e\/)([A-Za-z0-9-_]+)/i);
+    if (idMatch) {
+      const spreadsheetId = idMatch[1];
+      const mGid = adminUrl.match(/[?#]gid=(\d+)/);
+      gid = gid || (mGid ? mGid[1] : "0");
+      csv_url_public =
+        `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=csv&gid=${gid}`;
+      spreadsheet_id = spreadsheet_id || spreadsheetId;
+      sheet_url_admin = adminUrl;
     }
+  }
+}
+
 
     if (!title || !csv_url_public) {
       return res.status(400).json({ error: "title and csv_url_public are required" });
