@@ -2220,14 +2220,13 @@ if (/\/spreadsheets\/d\/[^/]+\/export\?/i.test(rawUrl)) {
   csvUrl = u.toString();
 }
 // 2) PUBLISH-TO-WEB links: /spreadsheets/d/e/<KEY>/pub ...
+// Publish-to-web links: do NOT add/force gid or single; just ensure CSV output
 else if (/\/spreadsheets\/d\/e\/[A-Za-z0-9-_]+\/pub/i.test(rawUrl)) {
   const u = new URL(rawUrl);
-  gid = u.searchParams.get("gid") || "0";
-  if (!u.searchParams.get("output")) u.searchParams.set("output", "csv");
-  if (!u.searchParams.get("single")) u.searchParams.set("single", "true");
-  u.searchParams.set("gid", gid);
+  u.searchParams.set("output", "csv");     // convert to CSV endpoint
   csvUrl = u.toString();
 }
+
 // 3) Normal edit links ONLY (be strict; don't match /d/e/…)
 else {
   const idMatch = rawUrl.match(/\/spreadsheets\/d\/(?!e\/)([A-Za-z0-9-_]+)/i);
@@ -2574,18 +2573,19 @@ const adminUrl = (sheet_url_admin || delivery_url || "").trim();
 
 
 if (!csv_url_public && adminUrl) {
-  if (/\/spreadsheets\/d\/e\/[A-Za-z0-9-_]+\/pub/i.test(adminUrl)) {
-    const u2 = new URL(adminUrl);
-    if (!u2.searchParams.get("output")) u2.searchParams.set("output", "csv");
-    if (!u2.searchParams.get("single")) u2.searchParams.set("single", "true");
-    if (!u2.searchParams.get("gid")) u2.searchParams.set("gid", gid || "0");
-    csv_url_public = u2.toString();
+ // Publish-to-web URLs: keep what Google gives you; only ensure CSV output.
+// DO NOT force gid or single here.
+if (/\/spreadsheets\/d\/e\/[A-Za-z0-9-_]+\/pub/i.test(adminUrl)) {
+  const u2 = new URL(adminUrl);
+  u2.searchParams.set("output", "csv");            // only switch to CSV
+  csv_url_public = u2.toString();
 
-    // keep optional references
-    spreadsheet_id = spreadsheet_id ||
-      (adminUrl.match(/\/spreadsheets\/d\/e\/([A-Za-z0-9-_]+)/)?.[1] || "");
-    sheet_url_admin = adminUrl;
-  } else {
+  // keep optional references (do not rely on gid here)
+  spreadsheet_id =
+    spreadsheet_id || (adminUrl.match(/\/spreadsheets\/d\/e\/([A-Za-z0-9-_]+)/)?.[1] || "");
+  sheet_url_admin = adminUrl;
+}
+else {
     const idMatch = adminUrl.match(/\/spreadsheets\/d\/(?!e\/)([A-Za-z0-9-_]+)/i);
     if (idMatch) {
       const spreadsheetId = idMatch[1];
