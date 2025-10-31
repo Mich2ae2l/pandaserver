@@ -2110,6 +2110,56 @@ app.post("/api/admin/chat/:userId/read", requireAuth, requireAdmin, async (req, 
     res.json({ ok: true });
   }
 });
+// ADMIN: unlink/clear attached service for a premium item
+app.post("/api/admin/premium/items/:id/unlink", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = String(req.params.id);
+
+    // Optional flags: keep listed, or force unlist while unlinked
+    const forceUnlist = String(req.body?.unlist ?? "true").toLowerCase() !== "false";
+
+    const patch = {
+      // clear all delivery/service fields
+      csv_url_public: null,
+      sheet_url_admin: "",
+      spreadsheet_id: "",
+      gid: "0",
+      delivery_url: "",
+      updated_at: nowISO(),
+    };
+    if (forceUnlist) patch.listed = false;
+
+    const { data, error } = await supabase
+      .from("premium_items")
+      .update(patch)
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json({ ok: true, item: data });
+  } catch (e) {
+    console.error("/api/admin/premium/items/:id/unlink error:", e?.message || e);
+    res.status(500).json({ error: "Failed to unlink premium item" });
+  }
+});
+app.delete("/api/admin/premium/items/:id", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = String(req.params.id);
+    const { data, error } = await supabase
+      .from("premium_items")
+      .delete()
+      .eq("id", id)
+      .select()
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: "Not found" });
+    res.json({ ok: true, removed: { id: data.id, title: data.title } });
+  } catch (e) {
+    console.error("/api/admin/premium/items/:id DELETE error:", e?.message || e);
+    res.status(500).json({ error: "Failed to delete premium item" });
+  }
+});
 
 app.post("/api/chat/read", requireAuth, async (req, res) => {
   try {
@@ -2409,14 +2459,23 @@ app.post("/api/premium/purchase", requireAuth, async (req, res) => {
     });
 
     // grant entitlement
-    const { error: entErr } = await supabase
-      .from("premium_entitlements")
-      .insert({ user_id: user.id, item_id: id });
-    if (entErr) throw entErr;
+   // grant entitlement
+const { error: entErr } = await supabase
+  .from("premium_entitlements")
+  .insert({ user_id: user.id, item_id: id });
+if (entErr) throw entErr;
 
-    notifyUser(user.id, "balance", { balance_cents: newBal, reason: "premium_purchase" });
+// NEW: single-owner — delist from storefront after first purchase
+await supabase
+  .from("premium_items")
+  .update({ listed: false, updated_at: nowISO() })
+  .eq("id", id);
 
-    res.json({ ok: true, new_balance_cents: newBal });
+// live balance update
+notifyUser(user.id, "balance", { balance_cents: newBal, reason: "premium_purchase" });
+
+res.json({ ok: true, new_balance_cents: newBal });
+
   } catch (e) {
     console.error("/api/premium/purchase error:", e?.message || e);
     res.status(500).json({ error: "Purchase failed" });
