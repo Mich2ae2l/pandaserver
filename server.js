@@ -2512,8 +2512,7 @@ app.post("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res)
     // ---------- Normalize admin URL -> public CSV, spreadsheet_id, gid ----------
 const adminUrl = (sheet_url_admin || delivery_url || "").trim();
 
-// ---------- Normalize admin URL -> public CSV, spreadsheet_id, gid ----------
-const adminUrl = (sheet_url_admin || delivery_url || "").trim();
+
 
 if (!csv_url_public && adminUrl) {
   if (/\/spreadsheets\/d\/e\/[A-Za-z0-9-_]+\/pub/i.test(adminUrl)) {
