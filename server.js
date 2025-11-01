@@ -109,7 +109,7 @@ for (const d of [STORAGE_ROOT, TMP_DIR, PDF_DIR]) {
 app.use("/files", express.static(PDF_DIR));
 
 /* ---------------- Helpers ---------------- */
-const PRICE_CENTS = 250; // <— your unified price
+const PRICE_CENTS = 500; // <— your unified price
 const mutex = new Mutex();
 const nowISO = () => new Date().toISOString();
 const cents = (n) => Math.round(Number(n || 0));
