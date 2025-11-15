@@ -1,3 +1,4 @@
+
 // server.js - Panda API (all data in Supabase)
 // Notes:
 // - Supply env vars in .env (no secrets inline!)
@@ -468,16 +469,29 @@ function broadcastPresence() {
 }
 
 async function pushMessage({ user_id, from, text }) {
-  const msg = await chatInsert({ user_id, from, text: String(text || "").slice(0, MAX_TEXT) });
-  const bucket = userStreams.get(user_id);
-  if (bucket) for (const r of bucket) sseSend(r, "message", msg);
+  const msg = await chatInsert({
+    user_id,
+    from,
+    text: String(text || "").slice(0, MAX_TEXT),
+  });
+
+  // 🔴 Always use string key for SSE maps
+  const uid = String(user_id);
+  const bucket = userStreams.get(uid);
+  if (bucket) {
+    for (const r of bucket) sseSend(r, "message", msg);
+  }
+
+  // Admin streams get every message
   for (const r of adminStreams) sseSend(r, "message", msg);
+
   return msg;
 }
 
-// ---- NEW: push a custom event (e.g., balance) to a specific user's SSE stream ----
 function notifyUser(user_id, type, payload) {
-  const bucket = userStreams.get(user_id);
+  // 🔴 Same normalization here
+  const uid = String(user_id);
+  const bucket = userStreams.get(uid);
   if (!bucket) return;
   for (const r of bucket) sseSend(r, type, payload);
 }
@@ -1966,9 +1980,12 @@ app.get("/api/chat/stream", requireAuth, (req, res) => {
     "Cache-Control": "no-cache, no-transform",
     Connection: "keep-alive",
   });
-  sseSend(res, "hello", { ok: true, user_id: req.user.id });
 
-  const uid = req.user.id;
+  // 🔴 Normalize to string once here
+  const uid = String(req.user.id);
+
+  sseSend(res, "hello", { ok: true, user_id: uid });
+
   onlineUsers.add(uid);
   broadcastPresence();
 
@@ -1987,6 +2004,7 @@ app.get("/api/chat/stream", requireAuth, (req, res) => {
     broadcastPresence();
   });
 });
+
 
 app.get("/api/admin/chat/:userId/history", requireAuth, requireAdmin, async (req, res) => {
   try {
