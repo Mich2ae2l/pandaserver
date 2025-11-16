@@ -2294,41 +2294,68 @@ else {
 /* ============ PREMIUM ITEMS (Admin) ============ */
 
 // List premium items
+// List premium items (supports ?limit=... from frontend)
 app.get("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res) => {
   try {
-    const { q = "", page = 1, per_page = 50 } = req.query;
+    // NEW: accept both per_page and limit, prefer limit (what your frontend sends)
+    const { q = "", page = 1, per_page, limit } = req.query;
+
     const pg = Math.max(Number(page) || 1, 1);
-    const pp = Math.min(Math.max(Number(per_page) || 50, 1), 200);
+
+    // prefer limit -> per_page -> 50
+    const rawPerPage = limit ?? per_page ?? 50;
+
+    // raise max to 1000 so ?limit=1000 works
+    const pp = Math.min(Math.max(Number(rawPerPage) || 50, 1), 1000);
 
     let query = supabase.from("premium_items").select("*");
+
     if (q) {
-      // simple client-side filter since ilike on multiple cols is fine too
-      const { data, error } = await query.order("created_at", { ascending: false }).limit(1000);
+      // when searching, pull up to 1000 rows and then slice in memory
+      const { data, error } = await query
+        .order("created_at", { ascending: false })
+        .limit(1000);
       if (error) throw error;
+
       const t = String(q).toLowerCase();
       const filtered = (data || []).filter((r) =>
         (r.title || "").toLowerCase().includes(t) ||
         (r.subtitle || "").toLowerCase().includes(t) ||
         (r.tags || "").toLowerCase().includes(t)
       );
+
       const start = (pg - 1) * pp;
-      return res.json({ total: filtered.length, page: pg, per_page: pp, items: filtered.slice(start, start + pp) });
+      return res.json({
+        total: filtered.length,
+        page: pg,
+        per_page: pp,
+        items: filtered.slice(start, start + pp),
+      });
     } else {
       const from = (pg - 1) * pp;
       const to = from + pp - 1;
+
       const { data, count, error } = await supabase
         .from("premium_items")
         .select("*", { count: "exact" })
         .order("created_at", { ascending: false })
         .range(from, to);
+
       if (error) throw error;
-      return res.json({ total: count ?? (data || []).length, page: pg, per_page: pp, items: data || [] });
+
+      return res.json({
+        total: count ?? (data || []).length,
+        page: pg,
+        per_page: pp,
+        items: data || [],
+      });
     }
   } catch (e) {
     console.error("/api/admin/premium/items GET error:", e?.message || e);
     res.status(500).json({ error: "Failed to list premium items" });
   }
 });
+
 /* ======== PUBLIC PREMIUM LIST ======== */
 // REPLACE your current: app.get("/api/premium/items", ...)
 app.get("/api/premium/items", async (req, res) => {
