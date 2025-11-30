@@ -2586,6 +2586,7 @@ app.get("/api/premium/stats", async (_req, res) => {
 
 // Create/save premium item (fixed to match DB columns)
 // Create/save premium item (FIXED: price_per_1k_cents + computed price_cents)
+// Create/save premium item (FIXED: price_per_1k_cents + computed price_cents)
 app.post("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res) => {
   try {
     let {
@@ -2593,6 +2594,9 @@ app.post("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res)
       subtitle = "",
       tags = "",
       listed = false,
+
+      // NEW: service coming from the frontend (e.g. "sheets", "docs", "financial-analytics")
+      service = "sheets",
 
       // pricing inputs
       min_rows = 1000,               // UI minimum rows
@@ -2611,40 +2615,45 @@ app.post("/api/admin/premium/items", requireAuth, requireAdmin, async (req, res)
       rows_estimate = 0,
     } = req.body || {};
 
+    // ---------- Normalise service ----------
+    let normalizedService = String(service || "sheets").toLowerCase().trim();
+
+    // Small clean-ups / aliases
+    if (["sheet"].includes(normalizedService)) normalizedService = "sheets";
+    if (["doc", "document"].includes(normalizedService)) normalizedService = "documents";
+
+    // Safety net: if something weird comes in, fall back to "sheets"
+    if (!normalizedService) normalizedService = "sheets";
+
     // ---------- Normalize admin URL -> public CSV, spreadsheet_id, gid ----------
-    // ---------- Normalize admin URL -> public CSV, spreadsheet_id, gid ----------
-const adminUrl = (sheet_url_admin || delivery_url || "").trim();
+    const adminUrl = (sheet_url_admin || delivery_url || "").trim();
 
+    if (!csv_url_public && adminUrl) {
+      // Publish-to-web URLs: keep what Google gives you; only ensure CSV output.
+      // DO NOT force gid or single here.
+      if (/\/spreadsheets\/d\/e\/[A-Za-z0-9-_]+\/pub/i.test(adminUrl)) {
+        const u2 = new URL(adminUrl);
+        u2.searchParams.set("output", "csv");            // only switch to CSV
+        csv_url_public = u2.toString();
 
-
-if (!csv_url_public && adminUrl) {
- // Publish-to-web URLs: keep what Google gives you; only ensure CSV output.
-// DO NOT force gid or single here.
-if (/\/spreadsheets\/d\/e\/[A-Za-z0-9-_]+\/pub/i.test(adminUrl)) {
-  const u2 = new URL(adminUrl);
-  u2.searchParams.set("output", "csv");            // only switch to CSV
-  csv_url_public = u2.toString();
-
-  // keep optional references (do not rely on gid here)
-  spreadsheet_id =
-    spreadsheet_id || (adminUrl.match(/\/spreadsheets\/d\/e\/([A-Za-z0-9-_]+)/)?.[1] || "");
-  sheet_url_admin = adminUrl;
-}
-else {
-    const idMatch = adminUrl.match(/\/spreadsheets\/d\/(?!e\/)([A-Za-z0-9-_]+)/i);
-    if (idMatch) {
-      const spreadsheetId = idMatch[1];
-      const mGid = adminUrl.match(/[?#]gid=(\d+)/);
-      gid = gid || (mGid ? mGid[1] : "0");
-      csv_url_public =
-        `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=csv&gid=${gid}`;
-      spreadsheet_id = spreadsheet_id || spreadsheetId;
-      sheet_url_admin = adminUrl;
+        // keep optional references (do not rely on gid here)
+        spreadsheet_id =
+          spreadsheet_id ||
+          (adminUrl.match(/\/spreadsheets\/d\/e\/([A-Za-z0-9-_]+)/)?.[1] || "");
+        sheet_url_admin = adminUrl;
+      } else {
+        const idMatch = adminUrl.match(/\/spreadsheets\/d\/(?!e\/)([A-Za-z0-9-_]+)/i);
+        if (idMatch) {
+          const spreadsheetId = idMatch[1];
+          const mGid = adminUrl.match(/[?#]gid=(\d+)/);
+          gid = gid || (mGid ? mGid[1] : "0");
+          csv_url_public =
+            `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=csv&gid=${gid}`;
+          spreadsheet_id = spreadsheet_id || spreadsheetId;
+          sheet_url_admin = adminUrl;
+        }
+      }
     }
-  }
-}
-
-
 
     if (!title || !csv_url_public) {
       return res.status(400).json({ error: "title and csv_url_public are required" });
@@ -2653,6 +2662,7 @@ else {
     // ---------- Pricing logic ----------
     const rows = Math.max(0, Number(rows_estimate || 0));
     const guidePer1k = Math.max(0, Number(price_per_1k_cents || 0));
+
     // allow explicit total override from body; else compute from rows × per-1k
     let totalCents = Number(price_cents);
     if (!totalCents && guidePer1k && rows) {
@@ -2666,7 +2676,8 @@ else {
       subtitle: String(subtitle || "").trim(),
       listed: !!listed,
 
-      service: "sheets",                         // NOT NULL in your DB
+      // ✅ use the normalised service value instead of hard-coded "sheets"
+      service: normalizedService,
       delivery_type: "gated",                    // keep if column exists
       delivery_url: String(delivery_url || ""),  // keep if column exists
 
@@ -2702,6 +2713,7 @@ else {
     return res.status(500).json({ error: "Failed to save premium item" });
   }
 });
+
 
 
 
